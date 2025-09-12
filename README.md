@@ -1,5 +1,9 @@
 This repository contains the code for the Stanford NAV Lab's official solution for the 2025 [Lunar Autonomy Challenge](https://lunar-autonomy-challenge.jhuapl.edu/).
 
+## Structure
+
+Our main agent is located under `agents/nav_agent.py`. This class is the entry point for the autonomy stack and defines the `run_step` method which is called every step of the simulator.
+
 ## Setup
 
 Clone this repo inside the unzipped LunarAutonomyChallenge folder provided by the organizers which contains the simulator:
