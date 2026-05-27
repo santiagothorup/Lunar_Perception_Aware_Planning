@@ -949,11 +949,11 @@ The existing `loop_closure` block is consumed unchanged by `Backend.__init__` an
 - Carla 0.9.15 (Python 3.10 wheel from the LAC sim's bundled `wheelhouse/`).
 - `astropy==5.2.2` + `lunarsky==0.2.1` (used by mission_weather.py and by our Phase 0 sun-position computation).
 
-**Configuration we made to the LAC sim (lives at `LunarAutonomyChallenge/LunarAutonomyChallenge/` inside this repo, gitignored):**
-- `RunLunarSimulator.sh`: exports `MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA` + `VK_LOADER_DRIVERS_DISABLE='*'` and forwards args to LAC.sh. (No longer useful on UE4 4.26 — see Section 13.D — but kept for documentation.)
+**Configuration we made to the LAC sim (lives at `LAC_SIM/` inside this repo, gitignored):**
+- `RunLunarSimulator.sh`: exports `MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA` and forwards args to LAC.sh. Uses Ubuntu 24.04 + kisak-mesa dzn path — no `VK_LOADER_DRIVERS_DISABLE` or `-opengl` flag needed.
 - `RunLeaderboard.sh`: `TEAM_CODE_ROOT` → this repo; `TEAM_AGENT` → `agents/nav_agent.py`; `TEAM_CONFIG` → `configs/config.json`; `LAC_BASE_PATH` → sim folder.
 
-**Compute:** NVIDIA RTX 4060 Laptop GPU + Intel Iris Xe iGPU on a Windows 11 laptop running WSL2. Lab workstation in Durand 339 (native Linux + NVIDIA) is the documented fallback if WSL Vulkan cannot be made to work.
+**Compute:** NVIDIA RTX 4060 Laptop GPU + Intel Iris Xe iGPU on a Windows 11 laptop running WSL2 (Python env + analysis work). **LAC simulator runs on an external SSH server with a native Linux + NVIDIA GPU** — WSL2 cannot run UE4 4.26 (see Section 13.D for full investigation). Python env on the WSL2 machine is complete and used for all non-sim work.
 
 **Data (current inventory):**
 - `data/DEMs/Moon_Map_01_2_rep0.dat` — LAC preset 2 heightmap (180, 180, 4), delivered by TA Adam Dai. Channels `[x, y, z, rock_bool]`.
@@ -991,7 +991,7 @@ The existing `loop_closure` block is consumed unchanged by `Backend.__init__` an
 | **5**   | Build `PerceptionAwareAgent` (drop-in fork of `agents/nav_agent.py`) | NOT STARTED |
 | **6**   | LRO mid-scale experiments (baseline vs ours) | NOT STARTED |
 | **7**   | LAC small-scale experiments (RMSE measurement) | BLOCKED on Phase 8 |
-| **8**   | LAC simulator bring-up on WSL | **IN PROGRESS — see Section 13.D** |
+| **8**   | LAC simulator bring-up | **BLOCKED on WSL2 — pivoting to SSH server (see Section 13.D)** |
 | **9**   | Paper writing | NOT STARTED |
 
 Stretch A/B/C remain as described in Sections 8.5–8.7 but are only attempted if Phases 1–7 are clean.
@@ -1026,16 +1026,21 @@ Validation script: `scripts/phase0_validation.py`. Inputs: `data/DEMs/Moon_Map_0
 
 **Verdict: predictor concept is plausible; preset 2 is not a sufficient test bed. Re-validate after sim bring-up with a planned trajectory through rough/elevated regions, with matched-features as the response variable.** Do NOT pivot the predictor design based on preset 2 alone.
 
-### 13.D Phase 8 status: sim bring-up
+### 13.D Phase 8 status: sim bring-up — DEFINITIVELY BLOCKED on WSL2
 
-Tried on Ubuntu 22.04 WSL with NVIDIA RTX 4060 dGPU + Intel Iris Xe iGPU. **Blocked**:
+**Full investigation log (2026-05-26):**
 
-- UE4 4.26 (the sim's engine) **dropped Linux OpenGL support entirely** in its Vulkan-only build. Our planned `-opengl` flag was silently overridden → "OpenGL is no longer supported for desktop platforms. Vulkan will be used instead." → fall back to llvmpipe (CPU software Vulkan) → GameThread timeout after 60 s → crash.
-- WSL2 + NVIDIA dGPU Vulkan requires either (a) Mesa's `dzn` Microsoft-D3D12-backed Vulkan driver, or (b) the WSL-aware NVIDIA Linux Vulkan ICD. Neither is present out-of-the-box on Ubuntu 22.04 (kisak-mesa PPA discontinued for jammy).
+1. **Ubuntu 22.04 WSL**: UE4 4.26 dropped OpenGL → falls back to llvmpipe (CPU Vulkan) → GameThread timeout 60 s → crash. No fix possible without hardware Vulkan ICD.
 
-**Current action**: switched to Ubuntu 24.04 in parallel WSL distro. Initial state: `mesa-vulkan-drivers 25.2.8` is installed but `dzn_icd.x86_64.json` is missing from `/usr/share/vulkan/icd.d/`. A separate Claude Code agent is debugging this in the new distro. The 22.04 install remains untouched as a fallback.
+2. **Ubuntu 24.04 WSL + kisak-mesa PPA**: Added `ppa:kisak/kisak-mesa`, got Mesa 26.1.1 with `dzn` (Microsoft Direct3D12 Vulkan implementation). `vkcube` confirmed rendering on NVIDIA RTX 4060. UE4 rejected the device with "Incompatible Vulkan driver found!" because `dzn` reports `conformanceVersion=0.0.0.0` and is missing `VK_EXT_robustness2`.
 
-**Fallback if Vulkan-on-WSL can't be made to work**: move to the Stanford lab workstation in Durand 339 (native Linux + NVIDIA, no WSL graphics issues).
+3. **Custom Vulkan layer** (`tools/lac_vulkan_compat_layer.c`): Wrote a layer that patches `conformanceVersion` to `1.3.0.0` and injects `VK_EXT_robustness2`. UE4 accepted the device and registered with the NVIDIA GPU. However, UE4 then hung indefinitely in `poll(/dev/dxg)` waiting for a D3D12 GPU fence that never signals. Threads show the main thread waiting on a D3D12 fence submitted during early pipeline state object (PSO) initialization; the GPU shows 1% utilization but never completes the work. This is a bug in `dzn`'s D3D12 command translation for UE4 4.26's PSO workload — not fixable via a Vulkan layer.
+
+4. **LunarG Vulkan SDK devsim layer**: Not available for Ubuntu 24.04 Noble (LunarG only supports up to 22.04 Jammy).
+
+**Verdict: WSL2 cannot run UE4 4.26.** The D3D12 fence hang is inside the Mesa `dzn` driver and cannot be patched externally. Native Linux + NVIDIA proprietary driver is required.
+
+**Resolution: SSH server with native Linux + NVIDIA GPU.** The LAC simulator runs headlessly using `Xvfb` (virtual framebuffer). Sensor cameras in Carla/UE4 render to GPU textures independently of the display — all sensor images, SLAM output, and RMSE measurements are produced identically to an interactive run. See `docs/PROJECT_TURNOVER.md` Section 9 for the complete server setup guide.
 
 ### 13.E Updated step plan (post-Phase 0 findings)
 

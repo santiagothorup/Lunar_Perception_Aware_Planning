@@ -8,7 +8,7 @@
 
 **Course**: AA278 Lunar PNT, Stanford, Spring 2026. Solo final project by Santiago Thorup.
 **Deadlines**: slides 2026-06-01 (in-class), report 2026-06-05 (4 PM PT, ION format, 6–8 pages).
-**Status as of 2026-05-26**: Phase 0 validation complete (results in `output/phase0_validation*/`). **Vulkan-on-WSL UNBLOCKED**: kisak-mesa PPA on Ubuntu 24.04 ships Mesa 26.1+ with the `dzn` driver, which exposes the NVIDIA RTX 4060 as `DRIVER_ID_MESA_DOZEN` via D3D12. `vkcube` confirmed rendering on the dGPU. UE4 should now run. **Next concrete step**: replay the env install in the 24.04 distro (per `SIM_STARTUP.md` Sections 1.1, 2, 3, 4) and launch the sim. No planner code written yet (deliberate — gated on richer Phase 0 results).
+**Status as of 2026-05-26**: Phase 0 validation complete. Python environment on WSL2 fully installed. **LAC simulator on WSL2 definitively blocked** — UE4 4.26 hangs due to a D3D12 fence timeout in Mesa's `dzn` driver (see `Project_Background.md` Section 13.D for full investigation). **Resolution: run the sim on an SSH server with native Linux + NVIDIA GPU using `Xvfb` for headless rendering.** Server setup is the immediate next step (see Section 9 of this file). No planner code written yet — deliberately gated on richer Phase 0 results from the sim.
 
 **One-sentence project description**: Build a **goal-to-goal** trajectory planner for a lunar rover that proactively routes through visually feature-rich terrain to minimize SLAM localization error, combining DEM-derived roughness + sun shadow casting into a feature-density predictor used as a soft cost in A*.
 
@@ -26,27 +26,26 @@
 
 ### What's done
 
-- ✅ **Sim environment install on 22.04 WSL** — every Python dep, all gotchas captured in `SIM_STARTUP.md`.
-- ✅ **Agent path imports cleanly** end-to-end (`Frontend`, `Backend`, `ArcPlanner`, `WaypointPlanner`, all reachable).
+- ✅ **Python env on Ubuntu 24.04 WSL2 — COMPLETE**: conda `lac` env, Python 3.10.20, `PYTHONNOUSERSITE=1`, PyTorch 2.4.1+cu121, LightGlue, apriltag, Carla 0.9.15, and all deps. Agent-path imports (`Frontend`, `Backend`, `ArcPlanner`, `WaypointPlanner`) confirmed green. See `SIM_STARTUP.md` Section 2 for the install procedure.
 - ✅ **Phase 0 validation script** (`scripts/phase0_validation.py`): roughness + shadow-casting + SuperPoint feature extraction + multi-distance lookahead + IID statistics + bootstrap CI + per-frame plots. ~900 lines, audited, runs end-to-end in <2 min on RTX 4060.
 - ✅ **Phase 0 results captured** for preset 2 (four runs preserved under `output/`):
   - `output/phase0_validation_kp512/` — initial run, 92% saturation, invalidated.
   - `output/phase0_validation_kp2048_no_shadow/` — uncapped, roughness only, H1b ≈ −0.11.
   - `output/phase0_validation_az263_575/` — full ρ_full, sun_az = 263.575° (astropy direct), H4b ≈ +0.05.
   - `output/phase0_validation/` — A/B-test flipped az = 83.575°, H4b ≈ −0.36 (worse → 263.575° is closer to correct).
-- ✅ **Findings synthesized** (see `Project_Background.md` Section 13.C in detail). Verdict: predictor is directionally correct (adding shadow flipped H4b from negative to slightly positive), but magnitudes are too small to be useful on preset 2 due to three identified confounds.
-- ✅ **Documents up to date**: `Project_Background.md`, `SIM_STARTUP.md`, and this file.
+- ✅ **Findings synthesized** (see `Project_Background.md` Section 13.C). Predictor directionally correct; magnitudes too small on preset 2 due to limited terrain variation — re-run on richer trajectory required.
+- ✅ **WSL2 sim investigation complete**: dzn (Mesa D3D12 Vulkan) gets UE4 to accept the device but hangs at D3D12 PSO init (GPU fence never signals). Root cause: Mesa `dzn` bug with UE4 4.26 workload. Compat layer written at `tools/lac_vulkan_compat_layer.c` (archived for reference).
+- ✅ **Documents up to date**: all three docs reflect current state as of 2026-05-26.
 
-### What's blocked
+### What's blocked / in progress
 
-- ❌ **Sim launch on 22.04**: UE4 4.26 dropped Linux OpenGL → falls back to Vulkan → only llvmpipe (software CPU) → GameThread timeout at 60 s. **Abandoned in favor of 24.04.**
-- ✅ **Vulkan on 24.04 RESOLVED** (2026-05-26): added the `ppa:kisak/kisak-mesa` PPA on noble, ran `apt full-upgrade`, Mesa went 25.2 → 26.1.1 and `dzn_icd.x86_64.json` appeared in `/usr/share/vulkan/icd.d/`. `vulkaninfo --summary` now lists `Microsoft Direct3D12 (NVIDIA GeForce RTX 4060 Laptop GPU)` as `PHYSICAL_DEVICE_TYPE_DISCRETE_GPU` / `DRIVER_ID_MESA_DOZEN`. `vkcube` confirmed rendering on the GPU. UE4 should now have a working Vulkan path.
-- 🔄 **Full env install in 24.04**: pending. The 24.04 distro currently has Vulkan + apt graphics packages; everything else from `SIM_STARTUP.md` Sections 1.1, 2, 3 has not been replayed there yet.
+- ❌ **LAC simulator on WSL2 — CLOSED**: D3D12 fence timeout inside Mesa `dzn`. Not fixable externally. Full write-up in `Project_Background.md` Section 13.D.
+- 🔄 **SSH server setup — NEXT STEP**: server identified, setup instructions in Section 9 of this file.
 
 ### What's deliberately not started
 
-- ❌ **Core planner code** — gated on richer Phase 0 results (see "Why we're holding off" below).
-- ❌ **Pulling HW3 `dem.py` + `util.py` into `lac/planning/`** — was Phase 1 of the original plan; can be done in parallel with sim debugging if you want a productive task that doesn't depend on Vulkan being fixed.
+- ❌ **Core planner code** — gated on Phase 0 re-run confirming |r| ≥ 0.2 on richer trajectory (see "Why we're holding off" below).
+- ❌ **Pulling HW3 `dem.py` + `util.py` into `lac/planning/`** — Phase 1 of the original plan; can (and should) be done on the WSL2 machine in parallel with server setup.
 
 ### Why we're holding off on the planner
 
@@ -110,7 +109,7 @@ Building the planner on top of weak/inconclusive validation risks 3–5 days of 
 
 ### Sim (gitignored)
 
-`LunarAutonomyChallenge/LunarAutonomyChallenge/` — 12 GB of UE4 binary + Carla wheels + Leaderboard package. Provided by JHU APL.
+`LAC_SIM/` — 12 GB of UE4 binary + Carla wheels + Leaderboard package. Provided by JHU APL.
 
 ---
 
@@ -171,11 +170,9 @@ A/B test for sun-azimuth convention: flipping to `az = 83.575°` produced H4b_pe
 
 ### IMMEDIATE
 
-**0. ~~Resolve Vulkan-on-WSL~~ → DONE 2026-05-26.** kisak-mesa PPA on 24.04 + apt full-upgrade gives Mesa 26.1.1 with dzn driver. NVIDIA RTX 4060 visible as `Microsoft Direct3D12 (NVIDIA ...)` `DRIVER_ID_MESA_DOZEN`. `vkcube` renders on the dGPU.
+**0. Set up the SSH server for headless sim runs.** WSL2 cannot run UE4 4.26 (dzn D3D12 fence hang, definitively closed). The sim runs headlessly on a native Linux + NVIDIA GPU server via `Xvfb`. Full step-by-step instructions in **Section 9 of this file**. This is the blocking dependency for all sim-dependent work.
 
-**0a. Replay the full install in the 24.04 distro.** The 24.04 distro currently has Vulkan + apt graphics packages; everything else is fresh. Follow `SIM_STARTUP.md` Sections 1.1 (Conda), 2 (Python deps), 3 (sim install + script edits). Then run `SIM_STARTUP.md` Section 4 to launch the sim.
-
-Success criterion: `./RunLunarSimulator.sh` opens an Unreal window with the lunar scene rendering at >10 fps on the NVIDIA dGPU, AND `./RunLeaderboard.sh` in a second terminal prints `Step: 1, 2, 3, ...` with the rover visibly moving in the sim window.
+Success criterion: `./RunLeaderboard.sh` on the server prints `Step: 1, 2, 3, ...` and a `results/Moon_Map_01_<PRESET>_rep0.dat` file appears after the run completes.
 
 ### CAN RUN IN PARALLEL WITH (0)
 
@@ -240,7 +237,7 @@ Success criterion: `./RunLunarSimulator.sh` opens an Unreal window with the luna
 5. **Do not introduce a yaw sign flip.** Positive yaw in the simulator API is **clockwise** (opposite to standard math convention). The existing code already handles this.
 6. **Do not use `MAP_SIZE` (180) as the scene size in meters.** Scene is ±20 m, map is ±13.5 m (180 cells × 0.15 m/cell). These are different numbers.
 7. **Do not output velocity commands from the global planner.** Output 2-D `[x, y]` waypoints only — `ArcPlanner` produces velocity commands.
-8. **Do not run `pip install --force-reinstall -r LunarAutonomyChallenge/.../requirements.txt`** without then re-installing our pins on top. The sim's requirements would downgrade numpy and matplotlib.
+8. **Do not run `pip install --force-reinstall -r LAC_SIM/requirements.txt`** without then re-installing our pins on top. The sim's requirements would downgrade numpy and matplotlib.
 9. **Do not skip `PYTHONNOUSERSITE=1`.** User-site shadowing has eaten hours of debugging time.
 10. **Do not implement Stretch B or C** before the core planner is running and validated end-to-end.
 11. **Do not implement MPC for loop closure incentive.** A* greedy γ term is the chosen approach. MPC is documented in Section 8.7 as a design decision for the paper — not as future implementation work.
@@ -249,7 +246,7 @@ Success criterion: `./RunLunarSimulator.sh` opens an Unreal window with the luna
 
 ## 7. Open decisions you may need to make
 
-1. **If Vulkan-on-WSL stays broken**: move to Durand 339 lab workstation (yes/no, when).
+1. ~~**If Vulkan-on-WSL stays broken**~~ **→ DECIDED 2026-05-26**: WSL2 cannot run the sim. Using SSH server with native Linux + NVIDIA GPU and `Xvfb` headless rendering.
 2. **After step 4 visual verification**: lock in the world-frame sun azimuth convention. Document the chosen value in `Project_Background.md` and the predictor code.
 3. **After step 6**: STRONG/MODERATE/WEAK call. Determines whether the planner is built as designed or pivoted.
 4. **Around day 7 of 10**: cut decision for Stretch A/B/C. Default is to skip; only add if core + experiments are done by then.
@@ -264,17 +261,355 @@ Success criterion: `./RunLunarSimulator.sh` opens an Unreal window with the luna
 
 ---
 
-## 9. For a coding agent starting fresh in the Ubuntu 24.04 distro
+## 9. For a coding agent on the SSH server — complete setup playbook
 
-If you're a Claude Code agent that just got handed this project after a fresh WSL install, the linear path to get back to the current state is:
+This section is the complete, step-by-step guide for getting the experimental pipeline operational on a **native Linux SSH server with an NVIDIA GPU**. Follow it in order. Do not skip steps.
 
-1. Read this entire document (`docs/PROJECT_TURNOVER.md`).
-2. Read `docs/Project_Background.md` for the technical design, especially Section 7 (existing planner / SLAM interfaces), Section 8 (what to build), and Section 13 (current status).
-3. Read `docs/SIM_STARTUP.md` and execute it step by step. The "Quick sanity-check command sequence" at the end is your gate — when all 8 items return `present` / OK, you're caught up.
-4. If you're still blocked on Vulkan-on-WSL at Section 1.3 of SIM_STARTUP.md after ~30 minutes of trying, surface the blocker and ask whether to escape to the Durand 339 lab workstation. Do not burn more than 1 hour on Vulkan debugging without checking in.
-5. Once the sim runs, run `python scripts/phase0_validation.py` to confirm the preset 2 Phase 0 still reproduces the documented numbers (sanity check).
-6. Proceed with Section 5 of this file (the priority-ordered plan).
+> **Context**: The LAC simulator (UE4 4.26 + Carla) cannot run on WSL2 due to a Mesa `dzn` D3D12 driver bug. It runs correctly on native Linux with a native NVIDIA Vulkan driver. Sensor cameras in Carla render to GPU textures independently of any display window, so headless operation (`Xvfb`) produces full-fidelity images, SLAM output, and RMSE measurements identical to an interactive run.
 
-Do NOT start building the planner code until Phase 0 has been re-run on a richer trajectory with matched-features per Section 5 step 6 of this file. The temptation will be there; resist it. Three days of planner work on the wrong predictor is much worse than one day of Phase 0 v2 work.
+---
 
-When you finish a meaningful chunk of work, **update this file** under "Where we left off" so the next handoff has a clean starting point.
+### Step 0 — Read first
+
+1. Read this entire document.
+2. Read `docs/Project_Background.md`, especially Sections 7 (SLAM/planner interfaces), 8 (what to build), 13.A (evaluation plan), 13.C (Phase 0 findings), and 13.D (WSL2 investigation — explains why we're here).
+3. Skim `docs/SIM_STARTUP.md` Section 0 (Native Linux path) — it is the source of truth for the install procedure. The sections that follow it cover WSL2 and are now legacy.
+
+---
+
+### Step 1 — Verify server hardware and OS
+
+```bash
+nvidia-smi                     # must show an NVIDIA GPU with driver installed
+uname -r                       # Linux kernel
+lsb_release -a                 # Ubuntu 20.04 / 22.04 / 24.04 all work
+df -h ~                        # need ≥ 20 GB free (sim is ~12 GB + env ~4 GB)
+python3 --version              # any 3.x — we'll install our own via conda
+```
+
+**Required**: NVIDIA GPU with ≥ 4 GB VRAM (8 GB recommended), NVIDIA proprietary driver installed, Ubuntu 20.04–24.04.
+
+---
+
+### Step 2 — Install apt dependencies
+
+```bash
+sudo apt update
+sudo apt install -y \
+    build-essential pkg-config git \
+    xvfb \
+    libgl1-mesa-glx libglib2.0-0 \
+    cmake
+```
+
+- `xvfb` — virtual framebuffer for headless UE4 rendering (essential)
+- `libgl1-mesa-glx` — OpenGL runtime (needed by some Python packages)
+- `cmake` — needed to build `apriltag` from source
+
+---
+
+### Step 3 — Install Miniconda and create the `lac` env
+
+```bash
+cd /tmp
+curl -sLO https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh -b -p "$HOME/miniconda3"
+"$HOME/miniconda3/bin/conda" init bash
+exec bash   # reload shell
+
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
+conda create -y -n lac python=3.10
+conda activate lac
+
+# CRITICAL: prevent user-site shadowing — without this, pip silently ignores
+# version pins because ~/.local/lib/python3.10/ takes precedence.
+conda env config vars set PYTHONNOUSERSITE=1 -n lac
+conda deactivate && conda activate lac
+```
+
+---
+
+### Step 4 — Clone / transfer the repo
+
+**Option A — git clone** (if the repo is on GitHub):
+```bash
+mkdir -p ~/Stanford/AA278 && cd ~/Stanford/AA278
+git clone <REPO_URL> Lunar_Perception_Aware_Planning
+cd Lunar_Perception_Aware_Planning
+```
+
+**Option B — scp from WSL2 machine** (if not yet pushed):
+```bash
+# Run on your laptop (WSL2 terminal):
+scp -r ~/Stanford/AA278/Lunar_Perception_Aware_Planning \
+    user@server:~/Stanford/AA278/
+```
+
+Set `REPO` for the rest of these instructions:
+```bash
+export REPO="$HOME/Stanford/AA278/Lunar_Perception_Aware_Planning"
+```
+
+---
+
+### Step 5 — Install Python dependencies
+
+```bash
+conda activate lac
+cd $REPO
+
+# 1. Pin cmake < 4 (apriltag 0.0.16's CMakeLists rejects cmake 4.x syntax)
+pip install "cmake<4"
+
+# 2. Install apriltag before requirements.txt (needs --no-build-isolation to
+#    find our pinned cmake; a failing apriltag build aborts the whole transaction)
+pip install --no-build-isolation apriltag==0.0.16
+
+# 3. Install PyTorch with CUDA 12.1 index (requirements.txt doesn't specify the
+#    index URL; installing first prevents it being overridden by the CPU wheel)
+pip install torch==2.4.1 torchvision==0.19.1 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# 4. Remaining deps
+pip install -r requirements.txt
+pip install -e .
+
+# 5. Four undocumented deps used by the agent path
+pip install imageio munch segmentation-models-pytorch opt_einsum
+```
+
+**6. LightGlue** (needed by SLAM feature tracking):
+```bash
+mkdir -p ~/opt && cd ~/opt
+git clone https://github.com/cvg/LightGlue.git
+cd LightGlue && pip install -e .
+```
+
+**Verify imports**:
+```bash
+conda activate lac
+python -c "
+import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())
+import carla; print('carla OK')
+" 2>&1 | grep -v Warning
+```
+
+Expected: `torch 2.4.1+cu121  cuda= True` and `carla OK`.
+
+---
+
+### Step 6 — Transfer the LAC simulator (`LAC_SIM/`)
+
+The sim is a ~12 GB folder that is **gitignored** — it is not in the repo. Transfer it from the WSL2 machine or download from JHU APL:
+
+**Option A — scp from WSL2 laptop**:
+```bash
+# Run on your laptop (WSL2 terminal) — takes ~20 min on a fast connection:
+scp -r ~/Stanford/AA278/Lunar_Perception_Aware_Planning/LAC_SIM \
+    user@server:$REPO/
+```
+
+**Option B — copy from zip** (if you have the original JHU APL zip on the server):
+```bash
+cd $REPO
+unzip /path/to/LunarAutonomyChallenge.zip
+mv LunarAutonomyChallenge LAC_SIM
+```
+
+After transfer, confirm layout:
+```bash
+ls $REPO/LAC_SIM/
+# Must show: RunLunarSimulator.sh  RunLeaderboard.sh  LunarSimulator/  Leaderboard/  wheelhouse/
+```
+
+---
+
+### Step 7 — Install sim Python dependencies
+
+```bash
+conda activate lac
+SIM="$REPO/LAC_SIM"
+
+pip install "$SIM/wheelhouse/carla-0.9.15-cp310-cp310-manylinux_2_27_x86_64.whl"
+pip install dictor==0.1.12 tabulate==0.9.0 pygame==2.5.2
+
+python -c "import carla, dictor, tabulate, pygame; print('sim deps OK')"
+```
+
+---
+
+### Step 8 — Transfer model weights and data files
+
+These are gitignored and must be copied manually:
+
+```bash
+# UNet segmentation weights (~100 MB) — required by lac/perception/segmentation.py
+mkdir -p $REPO/models
+scp user@laptop:$REPO/models/unet_v2.pth $REPO/models/
+# OR download from the JHU APL portal under "Model weights"
+
+# Preset 2 DEM (needed for Phase 0 re-run)
+mkdir -p $REPO/data/DEMs
+scp user@laptop:$REPO/data/DEMs/Moon_Map_01_2_rep0.dat $REPO/data/DEMs/
+
+# Preset 2 image frames + ground-truth poses (needed for Phase 0)
+scp -r user@laptop:$REPO/data/Example_Implementations/HW3_Final/data/lac_data \
+    $REPO/data/Example_Implementations/HW3_Final/data/
+
+# LRO DEM tile (needed for mid-scale experiments)
+scp user@laptop:$REPO/data/Example_Implementations/HW3_Final/data/dem_tile.npz \
+    $REPO/data/Example_Implementations/HW3_Final/data/
+```
+
+---
+
+### Step 9 — Configure `RunLunarSimulator.sh` for native Linux
+
+On native Linux with the NVIDIA proprietary driver, no WSL2-specific env vars are needed. Replace the file contents:
+
+```bash
+sudo tee $REPO/LAC_SIM/RunLunarSimulator.sh << 'EOF'
+#!/bin/bash
+# Native Linux + NVIDIA GPU launch wrapper.
+# No WSL2/D3D12 env vars needed — native NVIDIA Vulkan driver used directly.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export SIMULATOR_ROOT="$SCRIPT_DIR/LunarSimulator"
+bash "$SIMULATOR_ROOT/LAC.sh" "$@"
+EOF
+```
+
+*(If you don't have sudo, the file may not be root-owned on the server — try `chmod` and a direct edit first.)*
+
+---
+
+### Step 10 — Configure `RunLeaderboard.sh` with server paths
+
+Edit the `TEAM_CODE_ROOT` line in `RunLeaderboard.sh` to point to where you cloned the repo on the server:
+
+```bash
+# Check what it currently says:
+grep TEAM_CODE_ROOT $REPO/LAC_SIM/RunLeaderboard.sh
+
+# If it still points to the WSL2 path (/home/sthorup/...), update it:
+sed -i "s|export TEAM_CODE_ROOT=.*|export TEAM_CODE_ROOT=\"$REPO\"|" \
+    $REPO/LAC_SIM/RunLeaderboard.sh
+
+# Verify:
+grep TEAM_CODE_ROOT $REPO/LAC_SIM/RunLeaderboard.sh
+```
+
+---
+
+### Step 11 — Make scripts executable
+
+```bash
+SIM="$REPO/LAC_SIM"
+chmod +x "$SIM/RunLunarSimulator.sh" "$SIM/RunLeaderboard.sh" \
+         "$SIM/LunarSimulator/LAC.sh" \
+         "$SIM/LunarSimulator/LAC/Binaries/Linux/LAC-Linux-Shipping"
+mkdir -p "$SIM/results"
+```
+
+---
+
+### Step 12 — Test headless sim launch
+
+The sim runs headlessly using `Xvfb` (virtual framebuffer). Sensor cameras render to GPU textures regardless of the display — all image data is produced identically to an interactive run.
+
+**Terminal A — start virtual display and launch sim**:
+```bash
+# Start the virtual display (do this once per server session)
+Xvfb :99 -screen 0 1920x1080x24 &
+export DISPLAY=:99
+
+conda activate lac
+cd $REPO/LAC_SIM
+./RunLunarSimulator.sh
+```
+
+Wait for the UE4 engine to finish loading — this takes **60–120 seconds** on first run (shader cache warm-up). The terminal will print a UE4 version string and then go quiet. This is normal — the sim is waiting for a Carla client to connect.
+
+**Terminal B — launch the leaderboard/agent** (after Terminal A has gone quiet):
+```bash
+export DISPLAY=:99
+conda activate lac
+cd $REPO/LAC_SIM
+./RunLeaderboard.sh
+```
+
+**Success criterion**: Terminal B prints `Step: 1`, `Step: 2`, ... The mission runs and completes. A file `$REPO/LAC_SIM/results/Moon_Map_01_<PRESET>_rep0.dat` is written.
+
+**If you want to monitor visually** (optional): install a VNC server and connect from your laptop:
+```bash
+sudo apt install -y tigervnc-standalone-server
+vncserver :1 -geometry 1920x1080 -depth 24
+# Then: DISPLAY=:1 ./RunLunarSimulator.sh
+# Connect your VNC viewer to server-ip:5901
+```
+
+---
+
+### Step 13 — Run the full sanity check
+
+```bash
+conda activate lac
+cd $REPO
+echo "Python    : $(python --version)"
+echo "Torch     : $(python -c 'import torch; print(torch.__version__, "cuda=", torch.cuda.is_available())')"
+echo "Carla     : $(python -c 'import carla; print("0.9.15 OK")')"
+echo "CUDA GPU  : $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)"
+echo "Sim dir   : $(test -d $REPO/LAC_SIM && echo present || echo MISSING)"
+echo "DEM       : $(test -f $REPO/data/DEMs/Moon_Map_01_2_rep0.dat && echo present || echo MISSING)"
+echo "UNet      : $(test -f $REPO/models/unet_v2.pth && echo present || echo MISSING)"
+echo "lac_data  : $(test -d $REPO/data/Example_Implementations/HW3_Final/data/lac_data && echo present || echo MISSING)"
+```
+
+All items should return `present` / OK. `cuda= True` is required.
+
+---
+
+### Step 14 — Run Phase 0 sanity check
+
+Confirms the analysis code still works on the server with the same data:
+
+```bash
+conda activate lac
+cd $REPO
+python scripts/phase0_validation.py
+```
+
+Expected: completes without error in <5 minutes, produces plots under `output/phase0_validation_*/`. The headline numbers should match the values in Section 4 of this file (H4b Pearson_raw ≈ +0.05 at d=3m). This is a no-new-data sanity check — it uses the existing preset 2 frames already in `data/`.
+
+---
+
+### Step 15 — Proceed with the experimental pipeline
+
+Once Steps 12–14 pass, you're fully operational. Follow the priority-ordered plan in **Section 5** of this document:
+
+1. **Run baseline `nav_agent.py` on a richer preset** (presets 5, 7, or 9 recommended — more terrain variation than preset 2). Collect ground-truth heightmap from `results/`.
+2. **Visually verify sun azimuth** — compare `dem_overlays.png` from Phase 0 output against actual frame images; confirm shadow direction matches.
+3. **Re-run Phase 0** with the richer trajectory + matched-features (LightGlue) as the response variable. Decision threshold: |H4b r| ≥ 0.2 on IID-subsampled data.
+4. **Build the planner** (Phases 1–5 in Section 5) — only after Phase 0 confirms the predictor.
+5. **Run experiments** (Phases 6–7 in Section 5).
+
+**Do NOT start building the planner until Phase 0 re-run confirms |r| ≥ 0.2.** See Section 5 for the full rationale.
+
+---
+
+### Common server-specific failures
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `./RunLunarSimulator.sh` hangs, no output | `DISPLAY` not set | `export DISPLAY=:99` before running; confirm `Xvfb :99` is running (`ps aux \| grep Xvfb`) |
+| Sim starts but `RunLeaderboard.sh` fails with `ModuleNotFoundError: leaderboard` | PYTHONPATH not set | Always run via `./RunLeaderboard.sh` which sets PYTHONPATH; do not call `nav_agent.py` directly |
+| UE4 crashes with "SIGSEGV" in Intel D3D12 libs | Intel iGPU D3D12 driver crash during cleanup | Harmless on native Linux if there's no Intel iGPU; if there is one, add `export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json` to `RunLunarSimulator.sh` |
+| `torch.cuda.is_available()` returns False | PyTorch CPU wheel installed | `pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu121` |
+| `import torch` returns wrong version | User-site shadowing | `conda env config vars set PYTHONNOUSERSITE=1 -n lac` then reactivate |
+| `./RunLeaderboard.sh` finds wrong `TEAM_CODE_ROOT` | Path still points to WSL2 | Re-run Step 10 with server's actual repo path |
+| UE4 exits after ~14 s with no output | First-run pipeline issue or missing display | Ensure `DISPLAY=:99` is set and Xvfb is running; check `~/.config/Epic/LAC/Saved/Logs/LAC.log` if it exists |
+
+---
+
+When you finish a meaningful chunk of work, **update the "Where we left off" section** (Section 2) of this file so the next handoff is clean.

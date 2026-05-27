@@ -167,4 +167,5 @@ cython_debug/
 
 data/Example_Implementations
 LunarAutonomyChallenge/
+LAC_SIM/
 output/
