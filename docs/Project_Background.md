@@ -940,20 +940,21 @@ The existing `loop_closure` block is consumed unchanged by `Backend.__init__` an
 
 **Authoritative procedure: see `docs/SIM_STARTUP.md`.** It is now the source of truth for the install, including all WSL-specific gotchas discovered during the 22.04 → 24.04 migration. The summary below is provided for quick orientation only — do not follow it as a recipe; use SIM_STARTUP.md.
 
-**Verified working configuration (as of 2026-05-26, Ubuntu 22.04 WSL):**
-- Miniconda env `lac` with Python 3.10.20, `PYTHONNOUSERSITE=1` permanently set (prevents `~/.local/lib/python3.10/site-packages` from shadowing the env).
-- PyTorch 2.4.1+cu121 (CUDA 12.1, ABI-compatible with WSL's NVIDIA driver), `torch.cuda.is_available()` confirmed True on the RTX 4060.
-- All deps from this repo's `requirements.txt` installed plus `imageio`, `munch`, `segmentation-models-pytorch`, `opt_einsum` (the four undocumented but required deps).
-- `cmake<4` pinned (apriltag 0.0.16's `CMakeLists.txt` uses `cmake_minimum_required` syntax that CMake 4.x rejects). `apriltag` installed with `--no-build-isolation`.
-- LightGlue cloned at `~/opt/LightGlue`, installed editable. No source patch needed; the upstream `lightglue.py:24` already uses the new `torch.amp.custom_fwd(..., device_type='cuda')` form.
+**Verified working configuration (as of 2026-05-26, `vader.stanford.edu` — PRIMARY):**
+- Miniconda env `lac` with Python 3.10.20, `PYTHONNOUSERSITE=1` permanently set.
+- PyTorch 2.4.1+cu121 (CUDA 12.1), `torch.cuda.is_available()` confirmed True on the RTX 4090.
+- All deps from this repo's `requirements.txt` plus `imageio`, `munch`, `segmentation-models-pytorch`, `opt_einsum` (four undocumented deps), plus `astropy==5.2.2` and `lunarsky==0.2.1` (also missing from requirements.txt; needed by `mission_weather.py`).
+- `cmake<4` pinned; `apriltag` installed with `--no-build-isolation`.
+- LightGlue cloned at `~/opt/LightGlue`, installed editable.
 - Carla 0.9.15 (Python 3.10 wheel from the LAC sim's bundled `wheelhouse/`).
-- `astropy==5.2.2` + `lunarsky==0.2.1` (used by mission_weather.py and by our Phase 0 sun-position computation).
 
-**Configuration we made to the LAC sim (lives at `LAC_SIM/` inside this repo, gitignored):**
-- `RunLunarSimulator.sh`: exports `MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA` and forwards args to LAC.sh. Uses Ubuntu 24.04 + kisak-mesa dzn path — no `VK_LOADER_DRIVERS_DISABLE` or `-opengl` flag needed.
-- `RunLeaderboard.sh`: `TEAM_CODE_ROOT` → this repo; `TEAM_AGENT` → `agents/nav_agent.py`; `TEAM_CONFIG` → `configs/config.json`; `LAC_BASE_PATH` → sim folder.
+**Configuration we made to the LAC sim (lives at `LAC_SIM/` inside this repo, gitignored — on the server it is a symlink to `/data/santiago/Lunar_Perception_Aware_Planning/LAC_SIM/`):**
+- `RunLunarSimulator.sh`: plain native Linux wrapper — no WSL2/D3D12 env vars needed.
+- `RunLeaderboard.sh`: `PATH` prepended with conda env bin (for `rerun`); `TEAM_CODE_ROOT` → this repo; `MISSIONS_SUBSET=1` (preset 2); `TEAM_AGENT` → `agents/nav_agent.py`.
+- `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json` — forces NVIDIA Vulkan ICD on the multi-GPU server.
+- DEM naming fix: `LAC_SIM/results/Moon_Map_01_1_rep0.dat` present (copy of `data/DEMs/Moon_Map_01_2_rep0.dat`; agent reads results by MISSIONS_SUBSET index, not preset number).
 
-**Compute:** NVIDIA RTX 4060 Laptop GPU + Intel Iris Xe iGPU on a Windows 11 laptop running WSL2 (Python env + analysis work). **LAC simulator runs on an external SSH server with a native Linux + NVIDIA GPU** — WSL2 cannot run UE4 4.26 (see Section 13.D for full investigation). Python env on the WSL2 machine is complete and used for all non-sim work.
+**Compute:** `vader.stanford.edu` — native Ubuntu 20.04, 2× NVIDIA GeForce RTX 4090 (24 GB each), 125 GB RAM. **This is the primary sim + analysis machine.** WSL2 laptop is legacy (NVIDIA RTX 4060 + Intel Iris Xe on Windows 11); UE4 4.26 cannot run on WSL2 due to a `dzn` D3D12 fence-timeout bug (see Section 13.D).
 
 **Data (current inventory):**
 - `data/DEMs/Moon_Map_01_2_rep0.dat` — LAC preset 2 heightmap (180, 180, 4), delivered by TA Adam Dai. Channels `[x, y, z, rock_bool]`.
@@ -969,7 +970,7 @@ The existing `loop_closure` block is consumed unchanged by `Backend.__init__` an
 
 ## 13. Implementation Order / Current Status
 
-> **Date snapshot: 2026-05-26.** Deadline: 2026-06-05 (report) / 2026-06-01 (slides). ~10 days remaining.
+> **Date snapshot: 2026-05-26 (updated end-of-day).** Deadline: 2026-06-05 (report) / 2026-06-01 (slides). ~10 days remaining.
 >
 > **CRITICAL FRAMING UPDATE:** The original draft of this doc described a coverage-maximizing planner benchmarked against `gen_five_loops`/`spiral`/`triangles`. **That is no longer the project.** Santiago's chosen problem statement is now **goal-to-goal trajectory planning**: given a start pose and a goal pose, plan a path that minimizes localization uncertainty (measured by SLAM RMSE vs. ground truth) while still being efficient. The baseline is a slope-aware A* planner (the one from AA278 HW3 P4, also in `data/Example_Implementations/HW3_Final/`). Sections 9.1 and 9.3 of this doc still reference the old coverage-baseline framing — treat those as superseded by Section 13.A below.
 
@@ -984,14 +985,14 @@ The existing `loop_closure` block is consumed unchanged by `Backend.__init__` an
 |---|---|---|
 | **0**   | Pre-implementation feature-density validation (does roughness predict SuperPoint feature density?) | DONE — see Section 13.C |
 | **0.5** | Same with shadow mask added (ρ_full = roughness × (1 − shadow_mask)) | DONE — see Section 13.C |
-| **1**   | Pull HW3 `DEM` + `AStar` helpers into `lac/planning/` | NOT STARTED |
-| **2**   | Build `PerceptionMap` (DEM + roughness + shadow-cast) | NOT STARTED |
+| **1**   | Pull HW3 `DEM` + `AStar` helpers into `lac/planning/` | **DONE** — `lac/planning/dem.py` + `lac/planning/astar.py`; added `DEM.from_lac_dat()` |
+| **2**   | Build `PerceptionMap` (DEM + roughness + shadow-cast) | NOT STARTED — **NEXT** |
 | **3**   | Build `EKFCovariancePropagator` (simplified 2D state) | NOT STARTED |
 | **4**   | Build `PerceptionAwarePlanner` (A* with slope + perception terms) | NOT STARTED |
 | **5**   | Build `PerceptionAwareAgent` (drop-in fork of `agents/nav_agent.py`) | NOT STARTED |
 | **6**   | LRO mid-scale experiments (baseline vs ours) | NOT STARTED |
-| **7**   | LAC small-scale experiments (RMSE measurement) | BLOCKED on Phase 8 |
-| **8**   | LAC simulator bring-up | **BLOCKED on WSL2 — pivoting to SSH server (see Section 13.D)** |
+| **7**   | LAC small-scale experiments (RMSE measurement) | NOT STARTED |
+| **8**   | LAC simulator bring-up | **DONE** — headless on `vader.stanford.edu` (native Linux + 2× RTX 4090). See Section 13.D. |
 | **9**   | Paper writing | NOT STARTED |
 
 Stretch A/B/C remain as described in Sections 8.5–8.7 but are only attempted if Phases 1–7 are clean.
@@ -1040,42 +1041,52 @@ Validation script: `scripts/phase0_validation.py`. Inputs: `data/DEMs/Moon_Map_0
 
 **Verdict: WSL2 cannot run UE4 4.26.** The D3D12 fence hang is inside the Mesa `dzn` driver and cannot be patched externally. Native Linux + NVIDIA proprietary driver is required.
 
-**Resolution: SSH server with native Linux + NVIDIA GPU.** The LAC simulator runs headlessly using `Xvfb` (virtual framebuffer). Sensor cameras in Carla/UE4 render to GPU textures independently of the display — all sensor images, SLAM output, and RMSE measurements are produced identically to an interactive run. See `docs/PROJECT_TURNOVER.md` Section 9 for the complete server setup guide.
+**Resolution: COMPLETE (2026-05-26).** Running headlessly on `vader.stanford.edu` — native Ubuntu 20.04, 2× NVIDIA GeForce RTX 4090 (24 GB each), 125 GB RAM. Simulator starts in ~5 s (PSO cache warm on fast GPU). `Step: 1, 2, 3, ...` confirmed; mission runs to completion and writes results files. See `docs/PROJECT_TURNOVER.md` Section 2 for the full server configuration and `docs/SIM_STARTUP.md` Section 0 for the setup procedure.
 
-### 13.E Updated step plan (post-Phase 0 findings)
+**Server-specific issues resolved during bring-up (see `SIM_STARTUP.md` Section 5 failures table and Section 0.11–0.13 for details):**
+- `astropy` and `lunarsky` were missing from `requirements.txt` — must be installed separately.
+- `rerun` binary not in PATH when using `setsid`/`nohup` — conda env bin must be prepended to PATH in `RunLeaderboard.sh`.
+- Multi-GPU server has both NVIDIA and Intel Vulkan ICDs — must set `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json`.
+- Agent reads `results/Moon_Map_01_{MISSIONS_SUBSET}_rep0.dat` at startup — DEMs must be copied to `LAC_SIM/results/` with index-based names before first run.
+- Processes launched from Claude Code / non-interactive shells must use `nohup setsid` to survive shell resets between commands.
+
+### 13.E Updated step plan (current state 2026-05-26)
 
 ```
-SIM BRING-UP (blocking, currently in progress)
-└── 0. Resolve Vulkan ICD issue on Ubuntu 24.04 WSL (or escape to lab workstation)
+DONE ✅
+├── 0. SSH server (vader.stanford.edu) fully operational — headless sim confirmed
+├── 1. lac/planning/dem.py — DEM class with from_lac_dat() added
+└── 2. lac/planning/astar.py — AStar[T] base class + path helpers
 
-INFRASTRUCTURE (can run in parallel with sim bring-up)
-├── 1. Pull `data/Example_Implementations/HW3_Final/supplemental/dem.py` -> `lac/planning/dem.py`
-└── 2. Pull `data/Example_Implementations/HW3_Final/supplemental/util.py:AStar` -> `lac/planning/astar.py`
+NEXT ← YOU ARE HERE
+└── 2a. Build lac/planning/perception_map.py (PerceptionMap: DEM + roughness + shadow-cast)
+     Does NOT require Phase 0 re-run — pure infrastructure over the settled DEM interface.
 
-PHASE 0 RE-RUN (post-sim, before planner)
-├── 3. Run baseline `nav_agent.py` end-to-end on one rich preset; capture ground-truth heightmap from output/
+CAN RUN IN PARALLEL WITH (2a)
+├── 3. Run baseline nav_agent.py end-to-end on one rich preset (presets 5/7/9 recommended)
 ├── 4. Visually verify sun azimuth convention in dem_overlays.png vs frame images
-├── 5. Plan a trajectory that crosses flat/rough/elevated terrain (drive manually if needed)
-├── 6. Re-run scripts/phase0_validation.py with that trajectory + matched-features (LightGlue) as the response variable
-└── 7. Confirm |H4b r| > 0.3 on a richer dataset before building the planner
+└── 5. Plan a trajectory that crosses flat/rough/elevated terrain
 
-CORE PLANNER (do NOT start until Phase 0 confirms predictor)
-├── 8.  Build PerceptionMap (uses dem.py + shadow casting already in scripts/phase0_validation.py)
-├── 9.  Build EKFCovariancePropagator (simplified 2D state per audit)
-├── 10. Build PerceptionAwarePlanner (subclass AStar; edge_cost = dist * (1 + α*slope_term + β*(1-ρ)))
-└── 11. Build PerceptionAwareAgent (drop-in fork of agents/nav_agent.py)
+PHASE 0 RE-RUN (post-steps 3-5, before core planner)
+├── 6. Re-run scripts/phase0_validation.py with rich trajectory + matched-features (LightGlue)
+└── 7. Decision threshold: |H4b Pearson_iid| ≥ 0.2 before building the planner
+
+CORE PLANNER (do NOT start until step 7 clears)
+├── 8.  Build EKFCovariancePropagator (simplified 2D state per Section 8.2)
+├── 9.  Build PerceptionAwarePlanner (subclass AStar; edge_cost = dist*(1+α*slope_term+β*(1-ρ)))
+└── 10. Build PerceptionAwareAgent (drop-in fork of agents/nav_agent.py)
 
 EXPERIMENTS
-├── 12. LRO mid-scale: ours vs P4 baseline, multiple (start, goal) pairs, predicted-D-opt metric
-├── 13. LAC small-scale: ours vs P4 baseline, hand-picked (start, goal) pairs, SLAM RMSE metric
-└── 14. Ablations (β=0 = baseline, β sweep, shadow on/off)
+├── 11. LRO mid-scale: ours vs P4 baseline, multiple (start, goal) pairs, predicted-D-opt metric
+├── 12. LAC small-scale: ours vs P4 baseline, hand-picked (start, goal) pairs, SLAM RMSE metric
+└── 13. Ablations (β=0 = baseline, β sweep, shadow on/off)
 
 PAPER (overlapping experiments)
-├── 15. Section 5 figures (LRO paths + LAC RMSE + Phase 0 scatter)
-└── 16. ION format, 6-8 pages, due 2026-06-05
+├── 14. Section 5 figures (LRO paths + LAC RMSE + Phase 0 scatter)
+└── 15. ION format, 6-8 pages, due 2026-06-05
 ```
 
-Stretch A/B/C remain on the table but are explicitly NOT scheduled — they only enter the plan if Phase 11 finishes by day 8 of 10.
+Stretch A/B/C remain on the table but are explicitly NOT scheduled — they only enter the plan if step 10 finishes by day 8 of 10.
 
 ---
 

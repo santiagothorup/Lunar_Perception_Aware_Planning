@@ -76,10 +76,20 @@ conda deactivate && conda activate lac
 ### 0.4 Clone the repo
 
 ```bash
-mkdir -p ~/Stanford/AA278 && cd ~/Stanford/AA278
+# On vader.stanford.edu the repo lives at:
+cd ~/Documents
 git clone <YOUR_FORK_URL> Lunar_Perception_Aware_Planning
 cd Lunar_Perception_Aware_Planning
 ```
+
+> **vader.stanford.edu note**: Large gitignored assets (`LAC_SIM/`, `data/Example_Implementations/`, `models/`) must live on the `/data/santiago/` partition. Create directories there and symlink them into the repo after cloning:
+> ```bash
+> mkdir -p /data/santiago/Lunar_Perception_Aware_Planning/{LAC_SIM,Example_Implementations,models}
+> ln -s /data/santiago/Lunar_Perception_Aware_Planning/LAC_SIM ~/Documents/Lunar_Perception_Aware_Planning/LAC_SIM
+> ln -s /data/santiago/Lunar_Perception_Aware_Planning/Example_Implementations \
+>        ~/Documents/Lunar_Perception_Aware_Planning/data/Example_Implementations
+> ln -s /data/santiago/Lunar_Perception_Aware_Planning/models ~/Documents/Lunar_Perception_Aware_Planning/models
+> ```
 
 ---
 
@@ -87,7 +97,7 @@ cd Lunar_Perception_Aware_Planning
 
 ```bash
 conda activate lac
-cd ~/Stanford/AA278/Lunar_Perception_Aware_Planning
+cd ~/Documents/Lunar_Perception_Aware_Planning
 
 # apriltag 0.0.16's CMakeLists.txt uses syntax that CMake 4.x rejects. Pin to 3.x first.
 pip install "cmake<4"
@@ -96,7 +106,12 @@ pip install "cmake<4"
 # otherwise pip's build isolation hides our cmake and the build fails.
 pip install --no-build-isolation apriltag==0.0.16
 
-# Main deps (torch 2.4.1+cu121, gtsam, symforce, transformers, ...)
+# PyTorch with CUDA 12.1 — install BEFORE requirements.txt so it doesn't
+# get overridden by the default CPU wheel from PyPI.
+pip install torch==2.4.1 torchvision==0.19.1 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# Main deps (gtsam, symforce, transformers, ...)
 pip install -r requirements.txt
 
 # Make the lac package importable
@@ -104,6 +119,10 @@ pip install -e .
 
 # Four undocumented deps used by the agent path but missing from requirements.txt:
 pip install imageio munch segmentation-models-pytorch opt_einsum
+
+# Two more undocumented deps needed by mission_weather.py (sun position computation):
+# NOT in requirements.txt — verified missing on vader.stanford.edu.
+pip install astropy==5.2.2 lunarsky==0.2.1
 ```
 
 ---
@@ -121,14 +140,45 @@ pip install -e .
 
 ### 0.7 Transfer LAC_SIM/ to the server
 
-`LAC_SIM/` is gitignored (~12 GB). Transfer it from your development machine:
+`LAC_SIM/` is gitignored (~12 GB). Transfer it from your development machine.
 
+**Option A — rsync** (works when direct SSH is available):
 ```bash
 # From your source machine (replace server-ip and paths):
 rsync -avz --progress \
-    /home/sthorup/Stanford/AA278/Lunar_Perception_Aware_Planning/LAC_SIM/ \
-    user@server-ip:~/Stanford/AA278/Lunar_Perception_Aware_Planning/LAC_SIM/
+    ~/Documents/Lunar_Perception_Aware_Planning/LAC_SIM/ \
+    santiagothorup@vader.stanford.edu:~/Documents/Lunar_Perception_Aware_Planning/LAC_SIM/
 ```
+
+**Option B — Google Drive + rclone** (required when rsync/scp is blocked by VPN):
+
+> **vader.stanford.edu note**: Direct SCP/rsync is blocked by the Stanford VPN. The method that worked was: zip the folder → upload to Google Drive from Windows → download via rclone on the server.
+
+```bash
+# 1. Zip and upload to Google Drive from Windows/WSL2 (do this on your laptop):
+#    - Compress LAC_SIM/ to LunarAutonomyChallenge.zip
+#    - Upload to Google Drive (browser or rclone)
+
+# 2. On the server — install rclone and configure Google Drive remote:
+curl https://rclone.org/install.sh | sudo bash
+rclone config   # create remote named "gdrive" pointing to your Google Drive
+
+# 3. Download and extract:
+cd /data/santiago/Lunar_Perception_Aware_Planning
+rclone copy gdrive:LunarAutonomyChallenge.zip . --progress
+unzip LunarAutonomyChallenge.zip
+
+# Fix nesting if the zip extracted with an extra subdirectory:
+ls  # if you see LunarAutonomyChallenge/ directory:
+mv LunarAutonomyChallenge/* LAC_SIM/
+rmdir LunarAutonomyChallenge
+```
+
+> **Storage note**: On `vader.stanford.edu`, large gitignored assets should live under `/data/santiago/Lunar_Perception_Aware_Planning/` (the data partition). Create symlinks from the repo so code paths remain unchanged:
+> ```bash
+> cd ~/Documents/Lunar_Perception_Aware_Planning
+> ln -s /data/santiago/Lunar_Perception_Aware_Planning/LAC_SIM LAC_SIM
+> ```
 
 After transfer, verify the structure:
 ```
@@ -162,13 +212,15 @@ python -c "import carla, dictor, tabulate, pygame; print('carla 0.9.15 OK')"
 ### 0.9 Transfer model weights + DEM data
 
 ```bash
-# From your source machine:
+# From your source machine (if rsync/scp is available):
 rsync -avz models/unet_v2.pth \
-    user@server-ip:~/Stanford/AA278/Lunar_Perception_Aware_Planning/models/
+    santiagothorup@vader.stanford.edu:~/Documents/Lunar_Perception_Aware_Planning/models/
 
 rsync -avz data/DEMs/ \
-    user@server-ip:~/Stanford/AA278/Lunar_Perception_Aware_Planning/data/DEMs/
+    santiagothorup@vader.stanford.edu:~/Documents/Lunar_Perception_Aware_Planning/data/DEMs/
 ```
+
+> **If rsync/scp is blocked by VPN** (as on vader with Stanford VPN): use Google Drive + rclone, same method as Section 0.7 Option B. Upload models/ and data/DEMs/ as separate zips; download and extract on the server.
 
 ---
 
@@ -202,17 +254,43 @@ EOF
 
 ### 0.11 Configure `RunLeaderboard.sh`
 
-Verify/patch `TEAM_CODE_ROOT` in `LAC_SIM/RunLeaderboard.sh` to point at the repo on this server:
+Verify/patch `RunLeaderboard.sh` to match the server. On `vader.stanford.edu` the current working version is:
 
 ```bash
-# The patched top section should look like:
-# export TEAM_CODE_ROOT="$HOME/Stanford/AA278/Lunar_Perception_Aware_Planning"
-# export TEAM_AGENT="$TEAM_CODE_ROOT/agents/nav_agent.py"
-# export TEAM_CONFIG="$TEAM_CODE_ROOT/configs/config.json"
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# MISSIONS_SUBSET=0 → preset 1
-# MISSIONS_SUBSET=1 → preset 2 (use this; our DEM is Moon_Map_01_2_rep0.dat)
+# CRITICAL: prepend conda env bin so 'rerun' binary is found.
+# Without this, nav_agent.py fails with "Failed to find Rerun Viewer executable in PATH".
+export PATH="/home/santiagothorup/miniconda3/envs/lac/bin:$PATH"
+
+export LAC_BASE_PATH="$SCRIPT_DIR"
+export LEADERBOARD_ROOT="$SCRIPT_DIR/Leaderboard"
+export TEAM_CODE_ROOT="/home/santiagothorup/Documents/Lunar_Perception_Aware_Planning"
+
+export PYTHONPATH="$LEADERBOARD_ROOT:$TEAM_CODE_ROOT:$PYTHONPATH"
+
+export TEAM_AGENT="$TEAM_CODE_ROOT/agents/nav_agent.py"
+export TEAM_CONFIG="$TEAM_CODE_ROOT/configs/config.json"
+
+export MISSIONS="$LEADERBOARD_ROOT/data/missions_training.xml"
+export MISSIONS_SUBSET="1"   # index 1 = preset 2 (Moon_Map_01_2_rep0.dat)
+# ...rest of file unchanged...
 ```
+
+Key things to patch when adapting to a new server:
+1. `PATH` prepend — conda env bin must contain `rerun`.
+2. `TEAM_CODE_ROOT` — absolute path to the repo root.
+3. `MISSIONS_SUBSET` — **index** into the missions XML, not the preset number. Index 0 = preset 1, index 1 = preset 2.
+
+**DEM naming**: `nav_agent.py` reads `results/Moon_Map_01_{MISSIONS_SUBSET}_rep0.dat` at startup (using the index, not the preset number). You must copy the DEM file to match:
+```bash
+# For MISSIONS_SUBSET=1 (preset 2):
+cp data/DEMs/Moon_Map_01_2_rep0.dat LAC_SIM/results/Moon_Map_01_1_rep0.dat
+# For MISSIONS_SUBSET=0 (preset 1):
+cp data/DEMs/Moon_Map_01_0_rep0.dat LAC_SIM/results/Moon_Map_01_0_rep0.dat
+```
+Without this, nav_agent.py crashes immediately with `FileNotFoundError`.
 
 ---
 
@@ -230,14 +308,36 @@ mkdir -p "$SIM/output"
 
 ### 0.13 Launch headless with Xvfb
 
-UE4 requires a display even when rendering to off-screen textures. On a headless SSH server, create a virtual display with Xvfb:
+UE4 requires a display even when rendering to off-screen textures. On a headless SSH server, create a virtual display with Xvfb.
+
+#### Recommended: use `launch_headless.sh`
+
+`launch_headless.sh` at the repo root handles everything — Xvfb, VK_ICD selection, sim + agent launch with `nohup setsid` for persistence after SSH shell exit, and port-2000 polling to sequence the launches correctly:
+
+```bash
+cd ~/Documents/Lunar_Perception_Aware_Planning
+bash launch_headless.sh
+tail -f logs/agent.log   # watch for "Step: 1, 2, ..."
+```
+
+#### Manual launch (two terminals)
+
+If you need more control:
 
 **Terminal A — start virtual display + simulator:**
 ```bash
+# Remove stale Xvfb lock if it exists from a previous session:
+rm -f /tmp/.X99-lock
+
 Xvfb :99 -screen 0 1920x1080x24 &
 export DISPLAY=:99
+
+# On multi-GPU servers (e.g., vader.stanford.edu), force NVIDIA ICD explicitly.
+# Without this, Mesa may be selected as the Vulkan provider → software rendering.
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
+
 conda activate lac
-cd ~/Stanford/AA278/Lunar_Perception_Aware_Planning/LAC_SIM
+cd ~/Documents/Lunar_Perception_Aware_Planning/LAC_SIM
 ./RunLunarSimulator.sh
 ```
 
@@ -247,11 +347,36 @@ Wait ~60 seconds for UE4 to fully load. Watch for the Carla server log output in
 ```bash
 export DISPLAY=:99
 conda activate lac
-cd ~/Stanford/AA278/Lunar_Perception_Aware_Planning/LAC_SIM
+cd ~/Documents/Lunar_Perception_Aware_Planning/LAC_SIM
 ./RunLeaderboard.sh
 ```
 
 Watch for `Step: 1`, `Step: 2`, ... — the agent is running.
+
+#### Non-interactive environments (important for SSH sessions)
+
+Standard `&` backgrounding does **not** survive shell exit — the SSH shell kills all child processes on logout. Use `nohup setsid` to make processes persist:
+
+```bash
+# Start sim in background, surviving shell exit:
+nohup setsid bash -c "
+  export DISPLAY=:99
+  export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
+  cd ~/Documents/Lunar_Perception_Aware_Planning/LAC_SIM
+  ./RunLunarSimulator.sh
+" > logs/sim.log 2>&1 &
+
+# Wait for port 2000 to open (sim ready):
+while ! ss -tlnp | grep -q ':2000'; do sleep 3; done
+
+# Start agent in background:
+nohup setsid bash -c "
+  export PATH='/home/santiagothorup/miniconda3/envs/lac/bin:$PATH'
+  export DISPLAY=:99
+  cd ~/Documents/Lunar_Perception_Aware_Planning/LAC_SIM
+  ./RunLeaderboard.sh
+" > logs/agent.log 2>&1 &
+```
 
 > **Headless image quality note:** `SceneCaptureComponent2D` in Carla renders to GPU textures independently of the display window. Sensor images (front camera, stereo pair, depth) are produced at full fidelity even in headless mode. Xvfb is only needed so UE4 can create its internal window object — it has no effect on sensor output.
 
@@ -282,21 +407,25 @@ export DISPLAY=:1
 conda activate lac
 export DISPLAY=:99   # if headless
 
+REPO="$HOME/Documents/Lunar_Perception_Aware_Planning"
 echo "Python   : $(python --version)"
 echo "Torch    : $(python -c 'import torch; print(torch.__version__, "cuda=", torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")')"
 echo "Carla    : $(python -c 'import carla; print("0.9.15 OK")')"
+echo "astropy  : $(python -c 'import astropy; print(astropy.__version__)')"
+echo "lunarsky : $(python -c 'import lunarsky; print("OK")')"
 echo "Vulkan   : $(vulkaninfo --summary 2>/dev/null | grep deviceName | head -2)"
 echo "GPU      : $(nvidia-smi --query-gpu=name,memory.free --format=csv,noheader)"
-echo "LAC_SIM  : $(test -d ~/Stanford/AA278/Lunar_Perception_Aware_Planning/LAC_SIM && echo present || echo MISSING)"
-echo "DEM      : $(test -f ~/Stanford/AA278/Lunar_Perception_Aware_Planning/data/DEMs/Moon_Map_01_2_rep0.dat && echo present || echo MISSING)"
-echo "UNet     : $(test -f ~/Stanford/AA278/Lunar_Perception_Aware_Planning/models/unet_v2.pth && echo present || echo MISSING)"
+echo "LAC_SIM  : $(test -d $REPO/LAC_SIM && echo present || echo MISSING)"
+echo "DEM      : $(test -f $REPO/data/DEMs/Moon_Map_01_2_rep0.dat && echo present || echo MISSING)"
+echo "DEM(idx) : $(test -f $REPO/LAC_SIM/results/Moon_Map_01_1_rep0.dat && echo present || echo MISSING — run DEM naming fix)"
+echo "UNet     : $(test -f $REPO/models/unet_v2.pth && echo present || echo MISSING)"
 ```
 
 Expected:
 - Python 3.10.x, Torch 2.4.1+cu121, `cuda= True`
-- Carla 0.9.15 OK
+- Carla 0.9.15 OK, astropy 5.2.2, lunarsky OK
 - Vulkan device name contains "NVIDIA" (native NVIDIA ICD, not Mesa/dzn)
-- All `present`
+- All `present` — the `DEM(idx)` check verifies the DEM naming fix was applied
 
 ---
 
@@ -593,8 +722,16 @@ Ground-truth heightmap written to `LAC_SIM/results/Moon_Map_01_<PRESET>_rep0.dat
 | Sim window doesn't open at all (WSL2) | WSLg not running / no DISPLAY | `echo $DISPLAY` should be `:0`; if empty, `wsl --shutdown` from PowerShell. |
 | UE4 hangs — no window, no crash; process stuck in `poll(/dev/dxg)` | **[WSL2 ONLY] `dzn` D3D12 fence timeout in PSO initialization** | **This is a fundamental bug in Mesa `dzn` with UE4 4.26. Not fixable via Vulkan layer, Mesa version, or any env var.** Root cause: UE4 submits PSO (pipeline state object) compilation work via D3D12; `dzn` mistranslates the D3D12 synchronization primitives; the GPU fence submitted to `/dev/dxg` never signals. Process hangs indefinitely. **Resolution: use native Linux (Section 0).** |
 | Xvfb fails with "cannot open display :99" | Xvfb not installed or not running | `sudo apt install xvfb` then `Xvfb :99 -screen 0 1920x1080x24 &` before launching sim |
+| Xvfb fails with "Server is already active for display 99" | Stale lock file from previous session | `rm -f /tmp/.X99-lock` then restart Xvfb |
 | `./RunLunarSimulator.sh` exits immediately on SSH server | No display set | `export DISPLAY=:99` before running (or launch Xvfb first — see Section 0.13) |
 | Native Linux: `vulkaninfo` shows Mesa software renderer only | NVIDIA driver not installed or not active | `nvidia-smi` to verify; re-install NVIDIA driver if missing |
+| On multi-GPU server: Vulkan uses Mesa/software instead of NVIDIA | Multiple Vulkan ICDs; Mesa selected first | `export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json` before launching |
+| `ModuleNotFoundError: No module named 'astropy'` | `astropy`/`lunarsky` not in requirements.txt | `pip install astropy==5.2.2 lunarsky==0.2.1` |
+| `RuntimeError: Failed to find Rerun Viewer executable in PATH` | `rerun` binary in conda env not on PATH | Prepend `export PATH="/home/santiagothorup/miniconda3/envs/lac/bin:$PATH"` in `RunLeaderboard.sh` |
+| `FileNotFoundError: results/Moon_Map_01_1_rep0.dat` | nav_agent.py reads DEM by MISSIONS_SUBSET **index**, not preset number | `cp data/DEMs/Moon_Map_01_2_rep0.dat LAC_SIM/results/Moon_Map_01_1_rep0.dat` (index 1 = preset 2) |
+| Background processes die when SSH shell exits | Standard `&` backgrounding killed on shell exit | Use `nohup setsid bash -c "..." > logfile 2>&1 &` — see Section 0.13 non-interactive pattern |
+| rsync/scp hangs silently or VS Code drag-and-drop fails | VPN blocks direct SSH data transfer | Use Google Drive + rclone as intermediary — see Section 0.7 Option B |
+| Sim crash "bind: Address already in use" on retry | Previous sim instance still bound to port 2000 | `pkill -f "LAC-Linux-Shipping"` then wait 5 s before relaunch |
 
 ---
 
@@ -621,15 +758,18 @@ echo "UNet      : $(test -f ~/Stanford/AA278/Lunar_Perception_Aware_Planning/mod
 
 When all of the following are true, you're ready for Phase 0 re-run and planner build.
 
-**Native Linux / SSH server (Section 0 path):**
-- [ ] `nvidia-smi` shows GPU with ≥8 GB free VRAM
-- [ ] `python -c "import torch; print(torch.cuda.is_available())"` → `True`
-- [ ] `python -c "import carla; print('OK')"` → `OK`
-- [ ] `Xvfb :99 ...` starts without error; `export DISPLAY=:99` in the shell
-- [ ] `./RunLunarSimulator.sh` starts and stays running (UE4 logs visible, no immediate crash)
-- [ ] `./RunLeaderboard.sh` in a second terminal prints `Step: 1, 2, 3, ...` and the rover moves
-- [ ] After a run, `results/Moon_Map_01_<PRESET>_rep0.dat` appears in the sim folder
-- [ ] `python scripts/phase0_validation.py` runs end-to-end on the preset 2 DEM
+**Native Linux / SSH server (Section 0 path) — vader.stanford.edu status as of 2026-05-26:**
+- [x] `nvidia-smi` shows GPU with ≥8 GB free VRAM ✅ (DONE on vader)
+- [x] `python -c "import torch; print(torch.cuda.is_available())"` → `True` ✅
+- [x] `python -c "import carla; print('OK')"` → `OK` ✅
+- [x] `python -c "import astropy, lunarsky; print('OK')"` → `OK` ✅
+- [x] `Xvfb :99 ...` starts without error; `export DISPLAY=:99` in the shell ✅
+- [x] `VK_ICD_FILENAMES` set to NVIDIA ICD on multi-GPU server ✅
+- [x] `./RunLunarSimulator.sh` starts and stays running (UE4 logs visible, no immediate crash) ✅
+- [x] `./RunLeaderboard.sh` in a second terminal prints `Step: 1, 2, 3, ...` and the rover moves ✅
+- [x] After a run, `results/Moon_Map_01_<SUBSET>_rep0.dat` appears in the sim folder ✅
+- [x] DEM naming fix applied (`results/Moon_Map_01_1_rep0.dat` present) ✅
+- [ ] `python scripts/phase0_validation.py` runs end-to-end on the preset 2 DEM (not yet re-run on server)
 
 **WSL2 (legacy — do not expect the sim to run):**
 - [ ] `vkcube` opens and renders at >30 fps
