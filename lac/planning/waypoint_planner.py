@@ -12,6 +12,7 @@ from lac.planning.waypoint_generation import (
     gen_five_loops,
     gen_nine_loops,
     gen_triangle_loops,
+    gen_phase0_transect,
 )
 from lac.params import WAYPOINT_REACHED_DIST_THRESHOLD
 
@@ -33,7 +34,8 @@ class WaypointPlanner:
         waypoint_reached_threshold: float = WAYPOINT_REACHED_DIST_THRESHOLD,
     ):
         """
-        trajectory_type: str = "spiral", "five_loops", "nine_loops", "triangles"
+        trajectory_type: str = "spiral", "five_loops", "nine_loops", "triangles",
+                              "phase0_transect"
 
         """
         match trajectory_type:
@@ -45,6 +47,8 @@ class WaypointPlanner:
                 self.waypoints = gen_nine_loops(initial_pose)
             case "triangles":
                 self.waypoints = gen_triangle_loops(initial_pose, additional_loops=False)
+            case "phase0_transect":
+                self.waypoints = gen_phase0_transect(initial_pose)
             case _:
                 raise ValueError(f"Unknown trajectory type: {trajectory_type}")
 

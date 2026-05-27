@@ -35,6 +35,7 @@ Phase 0.5 caveats (shadow-aware ρ_full extension):
 from __future__ import annotations
 
 import json
+import os
 import time
 import warnings
 from dataclasses import dataclass
@@ -45,7 +46,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-from lightglue import SuperPoint
+from lightglue import LightGlue, SuperPoint
+from lightglue.utils import rbd
 from PIL import Image
 from scipy.ndimage import uniform_filter
 from scipy.stats import pearsonr, spearmanr
@@ -59,13 +61,20 @@ from lac.util import grayscale_to_3ch_tensor
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEM_PATH = REPO_ROOT / "data" / "DEMs" / "Moon_Map_01_2_rep0.dat"
-LOG_PATH = (
-    REPO_ROOT / "data" / "Example_Implementations" / "HW3_Final" / "data" / "lac_data" / "data_log.json"
+
+# Input dataset. Override with PHASE0_DATA_DIR to analyze a new collection run (e.g. the
+# phase0_transect output); the directory must contain data_log.json + FrontLeft/ + FrontRight/.
+# Defaults to the original preset-2 lac_data set.
+_DEFAULT_DATA_DIR = (
+    REPO_ROOT / "data" / "Example_Implementations" / "HW3_Final" / "data" / "lac_data"
 )
-IMG_DIR = (
-    REPO_ROOT / "data" / "Example_Implementations" / "HW3_Final" / "data" / "lac_data" / "FrontLeft"
+DATA_DIR = Path(os.environ.get("PHASE0_DATA_DIR", _DEFAULT_DATA_DIR))
+LOG_PATH = DATA_DIR / "data_log.json"
+IMG_DIR = DATA_DIR / "FrontLeft"
+IMG_DIR_RIGHT = DATA_DIR / "FrontRight"
+OUT_DIR = Path(
+    os.environ.get("PHASE0_OUT_DIR", REPO_ROOT / "output" / "phase0_validation_matched_az263")
 )
-OUT_DIR = REPO_ROOT / "output" / "phase0_validation"
 
 # Map params (mirror lac/params.py:55-57)
 MAP_SIZE = 180
@@ -86,9 +95,17 @@ SATURATION_PCT_WARN = 10.0
 # CONVENTION: az is degrees CCW from world +X axis in the world XY plane; alt is degrees above
 # horizon. If shadows fall in the WRONG direction in dem_overlays.png (visual verification),
 # sweep SUN_AZIMUTH_DEG over: {83.575, 96.425, 186.425, 0, 90, 180, 270} until shadows align.
-SUN_AZIMUTH_DEG = 83.575  # A/B test: flipped 180° from astropy's 263.575° to test sun-frame convention
+SUN_AZIMUTH_DEG = 263.575  # astropy value (CCW from world +X). The 180°-flipped A/B value 83.575°
+                           # was rejected: it gave H4b ≈ −0.36 (worse direction). See output/
+                           # phase0_validation_az263_575/ (kept) vs phase0_validation/ (the 83.575° run).
 SUN_ALTITUDE_DEG = 1.488
 SHADOW_RAY_EPS = 1e-3  # vertical lift (m) preventing self-shadow on flat terrain
+
+# Feature matching (Phase 0.5 v2): matched features are the SLAM-usable subset of SuperPoint
+# keypoints. We count both temporal (FrontLeft[i-1]<->FrontLeft[i]) and stereo
+# (FrontLeft[i]<->FrontRight[i]) matches via LightGlue, mirroring lac/slam/feature_tracker.py.
+MATCH_MIN_SCORE = 0.5          # loop-closure-grade confidence (cf. configs/*.json loop_closure.min_score)
+MAX_TEMPORAL_GAP_STEPS = 2     # nominal image cadence (every other sim step); larger gap -> NaN temporal
 
 # Statistics
 SUBSAMPLE_MIN_DIST_M = 1.0
@@ -99,7 +116,8 @@ BOOTSTRAP_CI_PCT = 95.0
 # Plotting
 EXAMPLE_FRAME_COUNT = 3
 EXAMPLE_MIN_STEP_GAP = 50
-EXAMPLE_PATCH_HALF_CELLS = 10  # 21x21 patch (~3 m square)
+EXAMPLE_PATCH_MARGIN_M = 1.5  # heatmap patch extends best_d + this beyond the rover (m), so the
+                             # look-ahead marker always lands on the heatmap, not on black space
 
 
 # ============================================================================
@@ -280,12 +298,23 @@ def init_superpoint(max_kp: int) -> SuperPoint:
     return SuperPoint(max_num_keypoints=max_kp).eval().cuda()
 
 
-def extract_features(extractor: SuperPoint, img: np.ndarray) -> tuple[int, float, np.ndarray, np.ndarray]:
+def init_matcher() -> LightGlue:
+    """Instantiate the LightGlue matcher (same config as lac/slam/feature_tracker.py:59)."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA not available; LightGlue needs GPU for this script")
+    return LightGlue(features="superpoint").eval().cuda()
+
+
+def extract_features(
+    extractor: SuperPoint, img: np.ndarray
+) -> tuple[int, float, np.ndarray, np.ndarray, dict]:
     """Run SuperPoint on a (H, W) uint8 grayscale image.
 
-    Returns (n_kpts, mean_score, kpts_xy (N,2), scores (N,)). kpts_xy are pixel coords in the
-    EXTRACTED image (SuperPoint resizes internally; see lightglue/utils.py:142). We rescale
-    them back to original-image pixels for downstream plotting.
+    Returns (n_kpts, mean_score, kpts_xy (N,2), scores (N,), feats). `kpts_xy` are pixel coords in
+    the EXTRACTED image (SuperPoint resizes internally; see lightglue/utils.py:142), rescaled back
+    to original-image pixels for downstream plotting. `feats` is the raw batched SuperPoint output
+    dict (cuda tensors, keypoints in EXTRACTED coords) suitable for feeding straight to LightGlue;
+    the rescale above only mutates the CPU numpy copy, so `feats` is left untouched.
     """
     h0, w0 = img.shape
     tensor = grayscale_to_3ch_tensor(img).cuda()
@@ -298,7 +327,13 @@ def extract_features(extractor: SuperPoint, img: np.ndarray) -> tuple[int, float
     kpts[:, 1] *= h0 / float(sp_h)
     n = int(len(kpts))
     mean_score = float(scores.mean()) if n > 0 else float("nan")
-    return n, mean_score, kpts, scores
+    return n, mean_score, kpts, scores, feats
+
+
+def count_matches(matcher: LightGlue, feats_a: dict, feats_b: dict, min_score: float) -> int:
+    """Count LightGlue matches between two raw SuperPoint feature dicts that exceed `min_score`."""
+    m = rbd(matcher({"image0": feats_a, "image1": feats_b}))
+    return int((m["scores"] > min_score).sum())
 
 
 # ============================================================================
@@ -309,15 +344,27 @@ def extract_features(extractor: SuperPoint, img: np.ndarray) -> tuple[int, float
 def process_all_frames(
     frames: list[dict],
     extractor: SuperPoint,
+    matcher: LightGlue,
     fields: DEMFields,
     distances: tuple[float, ...],
 ) -> tuple[pd.DataFrame, dict]:
-    """Iterate frames, extract features, sample DEM fields, return a DataFrame + counters."""
+    """Iterate frames, extract features + matched-feature counts, sample DEM fields.
+
+    Three response variables per frame:
+      - n_features          : raw SuperPoint keypoint count on FrontLeft (auxiliary baseline).
+      - n_matched_temporal  : LightGlue matches FrontLeft[i-1]<->FrontLeft[i] above MATCH_MIN_SCORE.
+                              NaN on the first frame and across any image-cadence gap.
+      - n_matched_stereo    : LightGlue matches FrontLeft[i]<->FrontRight[i]. NaN if right is missing.
+    """
     rows: list[dict] = []
     skipped_no_image = 0
+    skipped_no_image_right = 0
     skipped_oob_pose = 0
     # Pre-cast shadow once (bool -> float64) so sample_field can NaN-check via np.isfinite.
     shadow_float = fields.shadow_mask.astype(np.float64)
+
+    prev_feats: dict | None = None  # FrontLeft feats of the previously processed frame
+    prev_step: int | None = None
 
     for idx, frame in enumerate(tqdm(frames, desc="frames", unit="f")):
         step = int(frame["step"])
@@ -335,9 +382,26 @@ def process_all_frames(
         if img is None:
             skipped_no_image += 1
             warnings.warn(f"image not loadable: {img_path}")
-            continue
+            continue  # prev_feats/prev_step intentionally NOT updated -> next frame's temporal = NaN
 
-        n_feats, mean_score, _, _ = extract_features(extractor, img)
+        n_feats, mean_score, _, _, feats_l = extract_features(extractor, img)
+
+        # Temporal match: FrontLeft[i-1] <-> FrontLeft[i], only if frames are cadence-adjacent.
+        if prev_feats is not None and (step - prev_step) <= MAX_TEMPORAL_GAP_STEPS:
+            n_matched_temporal = count_matches(matcher, prev_feats, feats_l, MATCH_MIN_SCORE)
+        else:
+            n_matched_temporal = float("nan")
+
+        # Stereo match: FrontLeft[i] <-> FrontRight[i].
+        img_r = cv2.imread(str(IMG_DIR_RIGHT / f"{step:06d}.png"), cv2.IMREAD_GRAYSCALE)
+        if img_r is None:
+            skipped_no_image_right += 1
+            n_matched_stereo = float("nan")
+        else:
+            _, _, _, _, feats_r = extract_features(extractor, img_r)
+            n_matched_stereo = count_matches(matcher, feats_l, feats_r, MATCH_MIN_SCORE)
+
+        prev_feats, prev_step = feats_l, step
 
         row: dict = {
             "frame_idx": idx,
@@ -347,6 +411,8 @@ def process_all_frames(
             "y": y,
             "heading_deg": heading_deg,
             "n_features": n_feats,
+            "n_matched_temporal": n_matched_temporal,
+            "n_matched_stereo": n_matched_stereo,
             "mean_score": mean_score,
             "roughness_at_pose": sample_field(fields.roughness, ij_pose),
             "rock_density_at_pose": sample_field(fields.rock_density, ij_pose),
@@ -372,6 +438,7 @@ def process_all_frames(
         "n_frames_input": len(frames),
         "n_frames_processed": len(df),
         "n_skipped_no_image": skipped_no_image,
+        "n_skipped_no_image_right": skipped_no_image_right,
         "n_skipped_oob_pose": skipped_oob_pose,
     }
     return df, counters
@@ -450,10 +517,20 @@ def correlate(
     }
 
 
-def compute_all_correlations(df: pd.DataFrame, distances: tuple[float, ...], rng: np.random.Generator) -> dict:
-    """Compute H1a, H1b/H2/H3 (per d), H4a, H4b (per d). best_d is driven by H4b (PRIMARY)."""
+def compute_all_correlations(
+    df: pd.DataFrame,
+    distances: tuple[float, ...],
+    rng: np.random.Generator,
+    response_col: str = "n_features",
+) -> dict:
+    """Compute H1a, H1b/H2/H3 (per d), H4a, H4b (per d) for `response_col`.
+
+    H2/H3 are response-independent (rocks vs roughness) but are recomputed per call for a
+    self-contained result. best_d is driven by H4b (PRIMARY). The IID subsample is spatial, so it
+    is identical across response variables; NaN rows in the response drop out via _pair_dropna.
+    """
     iid = subsample_iid(df, SUBSAMPLE_MIN_DIST_M)
-    nf = df["n_features"].to_numpy(dtype=np.float64)
+    nf = df[response_col].to_numpy(dtype=np.float64)
     args = (iid, BOOTSTRAP_BLOCK_SIZE, BOOTSTRAP_N, BOOTSTRAP_CI_PCT, rng)
 
     h1a = correlate(df["roughness_at_pose"].to_numpy(), nf, *args)
@@ -480,6 +557,7 @@ def compute_all_correlations(df: pd.DataFrame, distances: tuple[float, ...], rng
     best_d = _argmax_pearson("h4b")
     best_d_h1b = _argmax_pearson("h1b")
     return {
+        "response_col": response_col,
         "h1a": h1a, "h4a": h4a, "per_d": per_d,
         "best_d": best_d, "best_d_h1b": best_d_h1b,
         "n_iid_total": int(len(iid)),
@@ -602,12 +680,13 @@ def plot_frame_examples(
     fig, axes = plt.subplots(n, 3, figsize=(15, 5 * n))
     if n == 1:
         axes = axes[None, :]
-    H = EXAMPLE_PATCH_HALF_CELLS
+    # Size the patch so the rover AND its best_d look-ahead point both sit on the heatmap.
+    H = int(np.ceil((best_d + EXAMPLE_PATCH_MARGIN_M) / CELL_WIDTH))
 
     for row_i, frame_idx in enumerate(example_idxs):
         row = df.iloc[frame_idx]
         img = cv2.imread(str(IMG_DIR / row["image_filename"]), cv2.IMREAD_GRAYSCALE)
-        n_kp, _, kpts, scores = extract_features(extractor, img)
+        n_kp, _, kpts, scores, _ = extract_features(extractor, img)
 
         ax_img = axes[row_i, 0]
         ax_img.imshow(img, cmap="gray")
@@ -615,7 +694,8 @@ def plot_frame_examples(
             sizes = 4 + 30 * (scores / (scores.max() + 1e-9))
             ax_img.scatter(kpts[:, 0], kpts[:, 1], s=sizes, c="red", alpha=0.6, edgecolors="none")
         ax_img.set_title(
-            f"step={row['step']}, n_feats={n_kp}\n"
+            f"step={row['step']}, n_feats={n_kp}, "
+            f"match_t={row['n_matched_temporal']:.0f}, match_s={row['n_matched_stereo']:.0f}\n"
             f"rho_full@LA={row[f'rho_full_la_{best_d}']:.4f}, "
             f"shadow@LA={row[f'shadow_la_{best_d}']:.0f}"
         )
@@ -701,22 +781,26 @@ def plot_hypothesis_scatter(df: pd.DataFrame, corr: dict, out_path: Path) -> Non
     Row 0: H1a (roughness@pose) / H1b (roughness@lookahead).
     Row 1: H2 (rocks@lookahead) / H3 (roughness vs rocks).
     Row 2: H4a (rho_full@pose) / H4b PRIMARY (rho_full@lookahead).
+
+    The response variable (n_features / n_matched_temporal / n_matched_stereo) is read from
+    `corr["response_col"]`.
     """
     best_d = corr["best_d"]
-    nf = df["n_features"].to_numpy(dtype=np.float64)
+    resp = corr["response_col"]
+    nf = df[resp].to_numpy(dtype=np.float64)
     fig, axes = plt.subplots(3, 2, figsize=(13, 15))
 
     _scatter_with_fit(axes[0, 0], df["roughness_at_pose"].to_numpy(), nf,
-                      _corr_label(corr["h1a"], "H1a: roughness@pose -> n_features"))
-    axes[0, 0].set_xlabel("roughness @ rover position (m)"); axes[0, 0].set_ylabel("n_features")
+                      _corr_label(corr["h1a"], f"H1a: roughness@pose -> {resp}"))
+    axes[0, 0].set_xlabel("roughness @ rover position (m)"); axes[0, 0].set_ylabel(resp)
 
     _scatter_with_fit(axes[0, 1], df[f"roughness_la_{best_d}"].to_numpy(), nf,
-                      _corr_label(corr["per_d"][best_d]["h1b"], "H1b: roughness@lookahead -> n_features", best_d))
-    axes[0, 1].set_xlabel(f"roughness @ lookahead {best_d:.1f}m (m)"); axes[0, 1].set_ylabel("n_features")
+                      _corr_label(corr["per_d"][best_d]["h1b"], f"H1b: roughness@lookahead -> {resp}", best_d))
+    axes[0, 1].set_xlabel(f"roughness @ lookahead {best_d:.1f}m (m)"); axes[0, 1].set_ylabel(resp)
 
     _scatter_with_fit(axes[1, 0], df[f"rock_density_la_{best_d}"].to_numpy(), nf,
-                      _corr_label(corr["per_d"][best_d]["h2"], "H2: rock_density@lookahead -> n_features", best_d))
-    axes[1, 0].set_xlabel(f"rock density @ lookahead {best_d:.1f}m"); axes[1, 0].set_ylabel("n_features")
+                      _corr_label(corr["per_d"][best_d]["h2"], f"H2: rock_density@lookahead -> {resp}", best_d))
+    axes[1, 0].set_xlabel(f"rock density @ lookahead {best_d:.1f}m"); axes[1, 0].set_ylabel(resp)
 
     _scatter_with_fit(axes[1, 1], df[f"roughness_la_{best_d}"].to_numpy(),
                       df[f"rock_density_la_{best_d}"].to_numpy(),
@@ -725,14 +809,14 @@ def plot_hypothesis_scatter(df: pd.DataFrame, corr: dict, out_path: Path) -> Non
     axes[1, 1].set_ylabel(f"rock density @ lookahead {best_d:.1f}m")
 
     _scatter_with_fit(axes[2, 0], df["rho_full_at_pose"].to_numpy(), nf,
-                      _corr_label(corr["h4a"], "H4a: rho_full@pose -> n_features"))
-    axes[2, 0].set_xlabel("rho_full @ rover position"); axes[2, 0].set_ylabel("n_features")
+                      _corr_label(corr["h4a"], f"H4a: rho_full@pose -> {resp}"))
+    axes[2, 0].set_xlabel("rho_full @ rover position"); axes[2, 0].set_ylabel(resp)
 
     _scatter_with_fit(axes[2, 1], df[f"rho_full_la_{best_d}"].to_numpy(), nf,
-                      _corr_label(corr["per_d"][best_d]["h4b"], "H4b PRIMARY: rho_full@lookahead -> n_features", best_d))
-    axes[2, 1].set_xlabel(f"rho_full @ lookahead {best_d:.1f}m"); axes[2, 1].set_ylabel("n_features")
+                      _corr_label(corr["per_d"][best_d]["h4b"], f"H4b PRIMARY: rho_full@lookahead -> {resp}", best_d))
+    axes[2, 1].set_xlabel(f"rho_full @ lookahead {best_d:.1f}m"); axes[2, 1].set_ylabel(resp)
 
-    fig.suptitle(f"Phase 0.5 hypothesis scatter (best d={best_d:.1f}m driven by H4b)")
+    fig.suptitle(f"Phase 0.5 hypothesis scatter [{resp}] (best d={best_d:.1f}m driven by H4b)")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -740,6 +824,7 @@ def plot_hypothesis_scatter(df: pd.DataFrame, corr: dict, out_path: Path) -> Non
 
 def plot_r_vs_lookahead(corr: dict, out_path: Path) -> None:
     """Line plot of correlation strength vs lookahead distance, comparing H1b and H4b predictors."""
+    resp = corr["response_col"]
     ds = sorted(corr["per_d"].keys())
 
     def _series(metric: str, field: str) -> list[float]:
@@ -770,18 +855,20 @@ def plot_r_vs_lookahead(corr: dict, out_path: Path) -> None:
         ax.axvline(corr["best_d_h1b"], ls=":", color="gray", label=f"best d (H1b) = {corr['best_d_h1b']:.1f}m")
     ax.axhline(0, color="gray", lw=0.5)
     ax.set_xlabel("Lookahead distance (m)  -- x=0 is rover position")
-    ax.set_ylabel("Correlation with n_features")
-    ax.set_title("H1b vs H4b: roughness alone vs rho_full predictor")
+    ax.set_ylabel(f"Correlation with {resp}")
+    ax.set_title(f"H1b vs H4b [{resp}]: roughness alone vs rho_full predictor")
     ax.grid(alpha=0.3); ax.legend(fontsize=7, loc="best", ncol=2)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_roughness_quartile_bars(df: pd.DataFrame, best_d: float, out_path: Path) -> None:
-    """Mean n_features per quartile of roughness@best_d. Monotonic increase = signal present."""
+def plot_roughness_quartile_bars(
+    df: pd.DataFrame, best_d: float, out_path: Path, response_col: str = "n_features"
+) -> None:
+    """Mean `response_col` per quartile of roughness@best_d. Monotonic increase = signal present."""
     rough = df[f"roughness_la_{best_d}"].to_numpy()
-    nf = df["n_features"].to_numpy(dtype=np.float64)
+    nf = df[response_col].to_numpy(dtype=np.float64)
     mask = np.isfinite(rough) & np.isfinite(nf)
     rough, nf = rough[mask], nf[mask]
     q = np.quantile(rough, [0.0, 0.25, 0.5, 0.75, 1.0])
@@ -792,24 +879,59 @@ def plot_roughness_quartile_bars(df: pd.DataFrame, best_d: float, out_path: Path
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.bar(labels, means, yerr=stds, capsize=4, color="steelblue", edgecolor="black")
-    ax.set_ylabel("n_features (mean ± std)")
+    ax.set_ylabel(f"{response_col} (mean ± std)")
     ax.set_xlabel(f"Quartile of roughness @ lookahead {best_d:.1f}m (m)")
-    ax.set_title(f"Mean SuperPoint features per roughness quartile (best d={best_d:.1f}m)")
+    ax.set_title(f"Mean {response_col} per roughness quartile (best d={best_d:.1f}m)")
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_timeline(df: pd.DataFrame, best_d: float, out_path: Path) -> None:
+def plot_timeline(
+    df: pd.DataFrame, best_d: float, out_path: Path, response_col: str = "n_features"
+) -> None:
     """Per-frame timeline view -- useful for debugging stationary segments or detector instability."""
     fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
-    axes[0].plot(df["frame_idx"], df["n_features"], lw=0.8); axes[0].set_ylabel("n_features"); axes[0].grid(alpha=0.3)
+    axes[0].plot(df["frame_idx"], df[response_col], lw=0.8); axes[0].set_ylabel(response_col); axes[0].grid(alpha=0.3)
     axes[1].plot(df["frame_idx"], df[f"roughness_la_{best_d}"], lw=0.8, color="C2")
     axes[1].set_ylabel(f"roughness@LA d={best_d:.1f}m"); axes[1].grid(alpha=0.3)
     axes[2].plot(df["frame_idx"], df["heading_deg"], lw=0.8, color="C3")
     axes[2].set_ylabel("heading (deg)"); axes[2].set_xlabel("frame index"); axes[2].grid(alpha=0.3)
-    fig.suptitle("Per-frame timeline (debug)")
+    fig.suptitle(f"Per-frame timeline [{response_col}] (debug)")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_response_comparison(corr_by_resp: dict[str, dict], out_path: Path) -> None:
+    """The money plot: H4b (rho_full@lookahead) correlation vs distance, one line per response var.
+
+    Directly answers "did matched features help?": if n_matched_* lines sit above n_features, the
+    SLAM-usable subset of keypoints tracks rho_full better than the raw count. Solid = Pearson_iid
+    (the verdict statistic), dashed = Pearson_raw, X at x=0 = H4a (rho_full @ pose).
+    """
+    fig, ax = plt.subplots(figsize=(11, 6.5))
+    colors = {"n_features": "C7", "n_matched_temporal": "C0", "n_matched_stereo": "C3"}
+
+    for resp, corr in corr_by_resp.items():
+        ds = sorted(corr["per_d"].keys())
+        c = colors.get(resp, None)
+        iid = [corr["per_d"][d]["h4b"]["pearson_iid"] for d in ds]
+        raw = [corr["per_d"][d]["h4b"]["pearson_raw"] for d in ds]
+        ax.plot(ds, iid, "s-", color=c, label=f"{resp} Pearson_iid")
+        ax.plot(ds, raw, "o--", color=c, alpha=0.5, label=f"{resp} Pearson_raw")
+        ax.scatter([0], [corr["h4a"]["pearson_raw"]], color=c, marker="x", s=70)
+        ax.axvline(corr["best_d"], ls=":", color=c, alpha=0.4)
+
+    for thr in (0.2, 0.3, 0.5):  # verdict thresholds (|r|): WEAK/MODERATE/STRONG boundaries
+        ax.axhline(thr, color="green", lw=0.6, ls=":", alpha=0.5)
+        ax.axhline(-thr, color="green", lw=0.6, ls=":", alpha=0.5)
+    ax.axhline(0, color="gray", lw=0.5)
+    ax.set_xlabel("Lookahead distance (m)  -- x=0 (X marks) is rho_full @ pose (H4a)")
+    ax.set_ylabel("H4b correlation: rho_full@LA -> response")
+    ax.set_title("Response-variable comparison: does matched-feature counting sharpen the rho_full signal?")
+    ax.grid(alpha=0.3); ax.legend(fontsize=8, loc="best", ncol=3)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -822,7 +944,7 @@ def plot_timeline(df: pd.DataFrame, best_d: float, out_path: Path) -> None:
 
 def write_summary(
     df: pd.DataFrame,
-    corr: dict,
+    corr_by_resp: dict[str, dict],
     counters: dict,
     saturation_pct: float,
     runtime_s: float,
@@ -838,6 +960,8 @@ def write_summary(
         "ROUGHNESS_WINDOW_CELLS": ROUGHNESS_WINDOW_CELLS,
         "LOOKAHEAD_DISTANCES_M": list(LOOKAHEAD_DISTANCES_M),
         "SUPERPOINT_MAX_KP": SUPERPOINT_MAX_KP,
+        "MATCH_MIN_SCORE": MATCH_MIN_SCORE,
+        "MAX_TEMPORAL_GAP_STEPS": MAX_TEMPORAL_GAP_STEPS,
         "SUN_AZIMUTH_DEG": SUN_AZIMUTH_DEG,
         "SUN_ALTITUDE_DEG": SUN_ALTITUDE_DEG,
         "SHADOW_RAY_EPS": SHADOW_RAY_EPS,
@@ -845,23 +969,31 @@ def write_summary(
         "BOOTSTRAP_BLOCK_SIZE": BOOTSTRAP_BLOCK_SIZE,
         "BOOTSTRAP_N": BOOTSTRAP_N,
         "BOOTSTRAP_CI_PCT": BOOTSTRAP_CI_PCT,
+        "response_variables": {
+            "n_features": "raw SuperPoint keypoint count on FrontLeft (auxiliary baseline)",
+            "n_matched_temporal": "LightGlue matches FrontLeft[i-1]<->FrontLeft[i] above MATCH_MIN_SCORE",
+            "n_matched_stereo": "LightGlue matches FrontLeft[i]<->FrontRight[i] above MATCH_MIN_SCORE",
+        },
     }
+
+    def _corr_block(corr: dict) -> dict:
+        return {
+            "best_d": corr["best_d"],
+            "best_d_h1b": corr.get("best_d_h1b", corr["best_d"]),
+            "n_iid_subsample": corr["n_iid_total"],
+            "h1a_roughness_at_pose": corr["h1a"],
+            "h4a_rho_full_at_pose": corr["h4a"],
+            "per_lookahead_distance": {
+                str(d): corr["per_d"][d] for d in sorted(corr["per_d"].keys())
+            },
+        }
 
     summary = {
         "config": config,
         "counters": counters,
         "saturation_pct": saturation_pct,
         "runtime_s": runtime_s,
-        "n_iid_subsample": corr["n_iid_total"],
-        "best_d": corr["best_d"],
-        "best_d_h1b": corr.get("best_d_h1b", corr["best_d"]),
-        "correlations": {
-            "h1a_roughness_at_pose_vs_features": corr["h1a"],
-            "h4a_rho_full_at_pose_vs_features": corr["h4a"],
-            "per_lookahead_distance": {
-                str(d): corr["per_d"][d] for d in sorted(corr["per_d"].keys())
-            },
-        },
+        "correlations_by_response": {resp: _corr_block(corr) for resp, corr in corr_by_resp.items()},
     }
     json_path = out_dir / "summary.json"
     with json_path.open("w") as f:
@@ -869,18 +1001,35 @@ def write_summary(
     return json_path
 
 
-def print_stdout_summary(corr: dict, counters: dict, saturation_pct: float, runtime_s: float) -> None:
-    """Print the human-readable final summary block. H4b is PRIMARY in Phase 0.5."""
-    print("\n" + "=" * 60)
-    print(" Phase 0.5 Validation Summary (shadow-aware rho_full)")
-    print("=" * 60)
-    print(f"Frames input         : {counters['n_frames_input']}")
-    print(f"Frames processed     : {counters['n_frames_processed']}")
-    print(f"Skipped (no image)   : {counters['n_skipped_no_image']}")
-    print(f"OOB pose (logged)    : {counters['n_skipped_oob_pose']}")
-    print(f"KP saturation @{SUPERPOINT_MAX_KP:<4d}: {saturation_pct:.2f}%")
+def _verdict(iid_abs: float) -> str:
+    """Map |H4b Pearson_iid| to the STRONG/MODERATE/BORDERLINE/WEAK verdict (green-light at 0.2)."""
+    if not np.isfinite(iid_abs):
+        return "N/A     -- no finite IID correlation (insufficient paired samples)"
+    if iid_abs >= 0.5:
+        return "STRONG     -- proceed with planner as designed"
+    if iid_abs >= 0.3:
+        return "MODERATE   -- proceed, plan for Stretch B online refinement"
+    if iid_abs >= 0.2:
+        return "BORDERLINE -- meets the 0.2 green-light; proceed but confirm on the transect run"
+    return "WEAK       -- proceed to the richer transect sim run before building the planner"
+
+
+def print_stdout_summary(
+    corr_by_resp: dict[str, dict], counters: dict, saturation_pct: float, runtime_s: float
+) -> None:
+    """Print the human-readable final summary. Matched features are PRIMARY; n_features auxiliary."""
+    print("\n" + "=" * 72)
+    print(" Phase 0.5 v2 Validation Summary (shadow-aware rho_full + matched features)")
+    print("=" * 72)
+    print(f"Frames input            : {counters['n_frames_input']}")
+    print(f"Frames processed        : {counters['n_frames_processed']}")
+    print(f"Skipped (no FrontLeft)  : {counters['n_skipped_no_image']}")
+    print(f"Skipped (no FrontRight) : {counters.get('n_skipped_no_image_right', 0)}")
+    print(f"OOB pose (logged)       : {counters['n_skipped_oob_pose']}")
+    print(f"KP saturation @{SUPERPOINT_MAX_KP:<4d}   : {saturation_pct:.2f}%")
     if saturation_pct > SATURATION_PCT_WARN:
         print(f"  WARNING: rerun with higher SUPERPOINT_MAX_KP and rename output dir for parity.")
+    print(f"Sun azimuth             : {SUN_AZIMUTH_DEG:.3f}° (CCW from +X), alt {SUN_ALTITUDE_DEG:.3f}°")
     print()
 
     def _row(s: dict) -> str:
@@ -889,38 +1038,42 @@ def print_stdout_summary(corr: dict, counters: dict, saturation_pct: float, runt
             f"Pearson_iid(n={s['n_iid']:>3d})={s['pearson_iid']:+.3f}  Spearman={s['spearman']:+.3f}"
         )
 
-    print("H4b PRIMARY (rho_full@lookahead -> n_features), per distance:")
-    for d in sorted(corr["per_d"].keys()):
-        print(f"  d={d:>3.1f}m | {_row(corr['per_d'][d]['h4b'])}")
-    print(f"  -> best d (H4b) = {corr['best_d']:.1f}m   (best d (H1b) = {corr.get('best_d_h1b', corr['best_d']):.1f}m)")
+    # Per-response H4b detail.
+    for resp, corr in corr_by_resp.items():
+        tag = "PRIMARY" if resp.startswith("n_matched") else "auxiliary"
+        print(f"[{resp}]  ({tag})  H4b rho_full@lookahead -> {resp}, per distance:")
+        for d in sorted(corr["per_d"].keys()):
+            print(f"  d={d:>3.1f}m | {_row(corr['per_d'][d]['h4b'])}")
+        bd = corr["best_d"]
+        print(f"  -> best d (H4b) = {bd:.1f}m | H4a@pose: {_row(corr['h4a'])}")
+        print()
+
+    # Headline comparison table at each response's own best_d.
+    print("-" * 72)
+    print("H4b @ best_d comparison (|Pearson_iid| drives the verdict):")
+    print(f"  {'response':<20s} {'best_d':>6s} {'Pearson_raw':>12s} {'Pearson_iid':>12s} {'Spearman':>9s}")
+    for resp, corr in corr_by_resp.items():
+        bd = corr["best_d"]
+        s = corr["per_d"][bd]["h4b"]
+        print(f"  {resp:<20s} {bd:>5.1f}m {s['pearson_raw']:>+12.3f} {s['pearson_iid']:>+12.3f} {s['spearman']:>+9.3f}")
     print()
 
-    print("H1b reference (roughness@lookahead -> n_features), per distance:")
-    for d in sorted(corr["per_d"].keys()):
-        print(f"  d={d:>3.1f}m | {_row(corr['per_d'][d]['h1b'])}")
-    print()
-
-    best_d = corr["best_d"]
-    h1a, h4a = corr["h1a"], corr["h4a"]
-    h2 = corr["per_d"][best_d]["h2"]; h3 = corr["per_d"][best_d]["h3"]
-    print(f"H1a roughness@pose      -> n_features : {_row(h1a)}")
-    print(f"H4a rho_full@pose       -> n_features : {_row(h4a)}")
-    print(f"H2  rock_density@best_d -> n_features : {_row(h2)}")
-    print(f"H3  roughness@best_d    -> rock@best_d: {_row(h3)}")
-    print()
-
-    primary_iid = abs(corr["per_d"][best_d]["h4b"]["pearson_iid"])
-    if primary_iid >= 0.5:
-        verdict = "STRONG  -- proceed with planner as designed"
-    elif primary_iid >= 0.3:
-        verdict = "MODERATE -- proceed, plan for Stretch B online refinement"
-    else:
-        verdict = "WEAK    -- inspect shadow direction; if correct, re-test on a more varied preset"
-    print(f"VERDICT (|H4b Pearson_iid| at best_d): {verdict}")
+    # Headline verdict: best of the two matched-feature variables (PRIMARY).
+    matched = {r: c for r, c in corr_by_resp.items() if r.startswith("n_matched")}
+    best_resp, best_iid = None, -np.inf
+    for r, c in matched.items():
+        v = abs(c["per_d"][c["best_d"]]["h4b"]["pearson_iid"])
+        if np.isfinite(v) and v > best_iid:
+            best_resp, best_iid = r, v
+    print(f"HEADLINE VERDICT (matched-feature |H4b Pearson_iid|): {_verdict(best_iid)}")
+    if best_resp is not None:
+        print(f"  driven by {best_resp} (|Pearson_iid|={best_iid:.3f} at best_d="
+              f"{matched[best_resp]['best_d']:.1f}m)")
     print()
     print("NOTE: preset 2 trajectory occupies a 7m x 15m sub-region with height range 1.86 m.")
     print("A weak r on preset 2 alone does NOT falsify the predictor. Visually verify the shadow")
     print("direction in dem_overlays.png (bottom-left panel) and frame_examples.png before pivoting.")
+    print("Cross-check the response-variable comparison in response_comparison.png.")
     print()
     print(f"Total runtime: {runtime_s:.1f} s")
     print(f"Outputs: {OUT_DIR}")
@@ -958,32 +1111,47 @@ def main() -> None:
     frames = load_frames(LOG_PATH)
     print(f"  {len(frames)} frames")
 
-    print("Initializing SuperPoint")
+    print("Initializing SuperPoint + LightGlue")
     extractor = init_superpoint(SUPERPOINT_MAX_KP)
+    matcher = init_matcher()
 
-    print("Processing frames (SuperPoint + DEM lookups)")
-    df, counters = process_all_frames(frames, extractor, fields, LOOKAHEAD_DISTANCES_M)
+    print("Processing frames (SuperPoint + LightGlue temporal/stereo matches + DEM lookups)")
+    df, counters = process_all_frames(frames, extractor, matcher, fields, LOOKAHEAD_DISTANCES_M)
 
     saturation_pct = 100.0 * (df["n_features"] == SUPERPOINT_MAX_KP).sum() / max(len(df), 1)
 
-    print("Computing correlations")
-    corr = compute_all_correlations(df, LOOKAHEAD_DISTANCES_M, rng)
-    best_d = corr["best_d"]
+    # Response variables: matched features are PRIMARY; raw n_features is the auxiliary baseline.
+    response_vars = ("n_features", "n_matched_temporal", "n_matched_stereo")
+    suffix = {"n_features": "nfeat", "n_matched_temporal": "matched_temporal", "n_matched_stereo": "matched_stereo"}
+
+    print("Computing correlations (per response variable)")
+    corr_by_resp = {
+        resp: compute_all_correlations(df, LOOKAHEAD_DISTANCES_M, rng, response_col=resp)
+        for resp in response_vars
+    }
 
     print("Generating plots")
     traj_xy = df[["x", "y"]].to_numpy()
-    plot_dem_overlays(fields, traj_xy, OUT_DIR / "dem_overlays.png")
-    plot_hypothesis_scatter(df, corr, OUT_DIR / "hypothesis_scatter.png")
-    plot_r_vs_lookahead(corr, OUT_DIR / "r_vs_lookahead.png")
-    plot_roughness_quartile_bars(df, best_d, OUT_DIR / "roughness_quartile_bars.png")
-    plot_timeline(df, best_d, OUT_DIR / "timeline.png")
+    plot_dem_overlays(fields, traj_xy, OUT_DIR / "dem_overlays.png")  # response-independent
+    for resp in response_vars:
+        corr = corr_by_resp[resp]
+        bd = corr["best_d"]
+        sfx = suffix[resp]
+        plot_hypothesis_scatter(df, corr, OUT_DIR / f"hypothesis_scatter_{sfx}.png")
+        plot_r_vs_lookahead(corr, OUT_DIR / f"r_vs_lookahead_{sfx}.png")
+        plot_roughness_quartile_bars(df, bd, OUT_DIR / f"roughness_quartile_bars_{sfx}.png", response_col=resp)
+        plot_timeline(df, bd, OUT_DIR / f"timeline_{sfx}.png", response_col=resp)
+    plot_response_comparison(corr_by_resp, OUT_DIR / "response_comparison.png")  # the money plot
 
+    # Example frames keyed off the primary temporal-matched best_d (falls back to n_features).
+    primary = corr_by_resp.get("n_matched_temporal", corr_by_resp["n_features"])
+    best_d = primary["best_d"]
     example_idxs = select_example_frames(df, best_d, EXAMPLE_FRAME_COUNT, EXAMPLE_MIN_STEP_GAP)
     plot_frame_examples(df, example_idxs, extractor, fields, best_d, OUT_DIR / "frame_examples.png")
 
     runtime = time.time() - t0
-    write_summary(df, corr, counters, saturation_pct, runtime, OUT_DIR)
-    print_stdout_summary(corr, counters, saturation_pct, runtime)
+    write_summary(df, corr_by_resp, counters, saturation_pct, runtime, OUT_DIR)
+    print_stdout_summary(corr_by_resp, counters, saturation_pct, runtime)
 
 
 if __name__ == "__main__":

@@ -183,6 +183,75 @@ def gen_triangle_loops(
     return points
 
 
+def gen_phase0_transect(
+    initial_pose: np.ndarray,
+    sweep_xs: tuple = (-10.5, -7.5, -4.5, -2.5, 2.5, 4.5, 7.5, 10.5),
+    y_extent: float = 11.0,
+    lander_keepout: float = 2.5,
+    waypoint_spacing: float = 4.0,
+    peak_probe_x: float | None = 0.0,
+):
+    """Serpentine N-S raster for Phase 0 data collection.
+
+    Drives the rover across the whole map so its look-ahead samples the full range of DEM
+    roughness, sun-shadow, and rock density (the existing preset-2 run only covered a 7x15 m box,
+    starving the ρ_full correlation of signal). Returns an (N, 2) array of world-frame [x, y]
+    waypoints, like the other generators here.
+
+    Design constraints (verified against the sim/leaderboard):
+      - All `sweep_xs` keep |x| >= `lander_keepout`, so full-height sweeps never hit the 3x3 m
+        lander at the origin. (The central column is covered by the peak probe instead.)
+      - Waypoints are densified to <= `waypoint_spacing` m apart so no leg exceeds WAYPOINT_TIMEOUT
+        (2000 steps = 100 s at 0.2 m/s -> 20 m), which keeps a momentarily-stuck rover from
+        tripping the 300 s "blocked" termination.
+      - `initial_pose` only selects the nearest starting x-extreme and y-end, minimizing the
+        initial transit. No quadrant rotation (which would crash for a start on the x or y axis).
+
+    The peak probe is a collision-free excursion north of the lander (y >= `lander_keepout`) that
+    ends with a northward ascent at `peak_probe_x`, putting the ~3 m look-ahead on the dominant
+    preset-2 roughness peak at (0.22, 5.18). Set `peak_probe_x=None` to disable.
+    """
+    sweep_xs = np.asarray(sweep_xs, dtype=float)
+    if np.any(np.abs(sweep_xs) < lander_keepout):
+        raise ValueError(
+            f"sweep_xs must all satisfy |x| >= lander_keepout ({lander_keepout} m) to clear the "
+            "lander at the origin; use peak_probe_x for central coverage instead."
+        )
+
+    start_x, start_y = float(initial_pose[0, 3]), float(initial_pose[1, 3])
+
+    # Serpentine must begin at an x-extreme; pick the one nearest the rover.
+    xs = np.sort(sweep_xs)
+    if abs(start_x - xs[0]) > abs(start_x - xs[-1]):
+        xs = xs[::-1]
+    # First sweep heads from the y-end nearest the rover toward the far end.
+    a, b = (-y_extent, y_extent) if start_y <= 0 else (y_extent, -y_extent)
+
+    vertices = []
+    for x in xs:
+        vertices.append((x, a))
+        vertices.append((x, b))
+        a, b = b, a  # serpentine: reverse the next sweep so connectors stay short
+
+    if peak_probe_x is not None:
+        x_last = vertices[-1][0]
+        vertices.append((x_last, lander_keepout))      # up the last column to north of the lander
+        vertices.append((peak_probe_x, lander_keepout))  # west along y = keepout (clears the lander)
+        vertices.append((peak_probe_x, y_extent))      # northward ascent -> look-ahead hits the peak
+
+    # Densify each leg to <= waypoint_spacing.
+    waypoints = [np.asarray(vertices[0], dtype=float)]
+    for p0, p1 in zip(vertices[:-1], vertices[1:]):
+        p0, p1 = np.asarray(p0, dtype=float), np.asarray(p1, dtype=float)
+        dist = np.linalg.norm(p1 - p0)
+        if dist < 1e-9:
+            continue
+        n = int(np.ceil(dist / waypoint_spacing))
+        for k in range(1, n + 1):
+            waypoints.append(p0 + (p1 - p0) * (k / n))
+    return np.array(waypoints)
+
+
 def gen_loops_lander_lc(initial_pose):
     """
     Same as 5 loops above, but with stop and turn to loop at the lander at each corner.
