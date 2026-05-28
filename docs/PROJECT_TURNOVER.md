@@ -8,7 +8,7 @@
 
 **Course**: AA278 Lunar PNT, Stanford, Spring 2026. Solo final project by Santiago Thorup.
 **Deadlines**: slides 2026-06-01 (in-class), report 2026-06-05 (4 PM PT, ION format, 6–8 pages).
-**Status as of 2026-05-26**: Phase 0 validation complete. SSH server (`vader.stanford.edu`) fully operational — Python env installed, all data transferred, headless sim running end-to-end. Phase 1 planner infrastructure (`lac/planning/dem.py` + `lac/planning/astar.py`) complete. **Phase 2 (`lac/planning/perception_map.py`) is the current next step.** No SLAM-dependent planner code yet — deliberately gated on Phase 0 re-run on a richer trajectory confirming |r| ≥ 0.2.
+**Status as of 2026-05-27**: SSH server (`vader.stanford.edu`) fully operational — headless sim runs end-to-end. Phase 1 planner infrastructure (`lac/planning/dem.py` + `lac/planning/astar.py`) complete. Phase 0.5 v2 done: `phase0_validation.py` now uses **matched features** (LightGlue temporal + stereo); the preset-2 re-run is still **WEAK (0.18)**, confirming the limiter is terrain variation, not the predictor. **Phase 0 transect data-collection tooling is built and offline-validated** (`agents/phase0_collection_agent.py` + `gen_phase0_transect` + `launch_phase0.sh`). **IMMEDIATE NEXT (server action): run the transect on preset 2 (`./launch_phase0.sh`) and re-run `phase0_validation.py` on it (Section 9.A).** Core planner stays gated on that re-run confirming |r| ≥ 0.2.
 
 **One-sentence project description**: Build a **goal-to-goal** trajectory planner for a lunar rover that proactively routes through visually feature-rich terrain to minimize SLAM localization error, combining DEM-derived roughness + sun shadow casting into a feature-density predictor used as a soft cost in A*.
 
@@ -48,12 +48,19 @@
 - ✅ **Phase 1 — DEM + A* infrastructure — COMPLETE**:
   - `lac/planning/dem.py`: `DEM` dataclass with `from_npz()`, `from_lac_dat()` (new, for LAC .dat format), `query()`, `grad()`, `xy_to_rc()`, `rc_to_xy()`, `slope_deg_grid()`, `downsample()`.
   - `lac/planning/astar.py`: `AStar[T]` generic base class, `GridCoord`, `path_length()`, `path_max_slope_deg()`. Extracted from HW3 `supplemental/util.py`; all HW3-specific utilities dropped.
-- ✅ **Documents updated**: all three docs reflect current state as of 2026-05-26.
+- ✅ **Phase 0.5 v2 — matched features — COMPLETE (2026-05-27)**: `scripts/phase0_validation.py` now adds `n_matched_temporal` (FrontLeft i−1↔i) and `n_matched_stereo` (FrontLeft↔FrontRight) via a LightGlue matcher, runs the full correlation suite per response variable (`response_comparison.png`), locks `SUN_AZIMUTH_DEG=263.575°`, and is dataset-overridable via `PHASE0_DATA_DIR`/`PHASE0_OUT_DIR`. Preset-2 re-run → **WEAK (matched |H4b Pearson_iid|=0.18)**; matched beat raw (0.18 vs 0.155) but the limiter is terrain variation. Output: `output/phase0_validation_matched_az263/`. Full detail in `Project_Background.md` §13.C.
+- ✅ **Phase 0 transect collection tooling — BUILT + offline-validated (2026-05-27)**:
+  - `lac/planning/waypoint_generation.py:gen_phase0_transect()` — 8-sweep serpentine raster, lander-avoiding (|x|≥2.5 m sweeps), ≤4 m legs (beats `WAYPOINT_TIMEOUT`), north-of-lander peak probe targeting the (0.22, 5.18) roughness peak. + `"phase0_transect"` case in `waypoint_planner.py`.
+  - `agents/phase0_collection_agent.py` — headless-safe (no pynput/imshow), FrontLeft+FrontRight grayscale only, logs image-steps only via the existing `DataLogger` (output format already matches phase0).
+  - `launch_phase0.sh` (repo root) — sets `TEAM_AGENT` + `MISSIONS_SUBSET=1`, execs `launch_headless.sh`.
+  - Coverage pre-check vs the old box: ρ_full std **2.0×**, rock std **3.5×**, lit/shadow **47% vs 25%**, IID samples **~237 vs 39**. py_compile + waypoint unit checks all pass. **Not yet run on the server** — that's the immediate next step (Section 9.A).
+- ✅ **Documents updated**: all three docs reflect current state as of 2026-05-27.
 
 ### What's blocked / in progress
 
 - ❌ **LAC simulator on WSL2 — CLOSED**: D3D12 fence timeout inside Mesa `dzn`. Not fixable externally. Full write-up in `Project_Background.md` Section 13.D.
-- 🔄 **Phase 2 — `lac/planning/perception_map.py` — NEXT STEP**: `PerceptionMap` class wrapping DEM + roughness + shadow cast + sun modulation. See Section 5.
+- 🔄 **Phase 0.6 — transect collection + re-validation — IMMEDIATE (server action)**: run `./launch_phase0.sh` on vader, then re-run `phase0_validation.py` on the output. The gating re-run for the planner. **Step-by-step in Section 9.A.**
+- 🔄 **Phase 2 — `lac/planning/perception_map.py`**: `PerceptionMap` class wrapping DEM + roughness + shadow cast + sun modulation. Infrastructure — can proceed in parallel with Phase 0.6. See Section 5.
 
 ### What's deliberately not started
 
@@ -84,9 +91,13 @@ Building the planner on top of weak/inconclusive validation risks 3–5 days of 
 | `lac/planning/arc_planner.py` | inherited | 41-arc DWA local planner. Hooks for Stretch A (perception-weighted arc selection) |
 | `lac/planning/dem.py` | **OURS — Phase 1 DONE** | DEM dataclass with bilinear interp, gradient, slope grid, `from_lac_dat()` loader for LAC .dat format |
 | `lac/planning/astar.py` | **OURS — Phase 1 DONE** | `AStar[T]` generic base class + `path_length` + `path_max_slope_deg` helpers |
-| `scripts/phase0_validation.py` | **OURS — KEY** | The Phase 0 validation script. ~900 lines. Roughness + shadow + SuperPoint + stats + plots |
+| `scripts/phase0_validation.py` | **OURS — KEY** | The Phase 0 validation script. Roughness + shadow + SuperPoint + LightGlue matched features (temporal + stereo) + stats + plots. `PHASE0_DATA_DIR`/`PHASE0_OUT_DIR` env-overridable |
 | `scripts/train_segmentation.py` | inherited | Where the semantic-class RGB palette is documented (line 21-27) |
+| `lac/planning/waypoint_generation.py` | inherited + **OURS** | Added `gen_phase0_transect()` — the Phase 0 data-collection raster |
+| `lac/planning/waypoint_planner.py` | inherited + **OURS** | Added `"phase0_transect"` trajectory_type case |
+| `agents/phase0_collection_agent.py` | **OURS — Phase 0 collector** | Headless-safe data-collection agent: drives `phase0_transect`, logs FrontLeft+FrontRight + GT poses |
 | `launch_headless.sh` | **OURS — server tool** | Wrapper: Xvfb + VK_ICD_FILENAMES + sim launch (port-2000 poll) + agent launch, all with nohup/setsid |
+| `launch_phase0.sh` | **OURS — server tool** | Runs the transect collection: sets TEAM_AGENT=phase0_collection_agent + MISSIONS_SUBSET=1, execs `launch_headless.sh` |
 
 ### Data
 
@@ -108,7 +119,7 @@ Building the planner on top of weak/inconclusive validation risks 3–5 days of 
 | Path | Description |
 |---|---|
 | `docs/Project_Background.md` | Technical design doc. Read SECOND (after this file). Section 13 has the latest status |
-| `docs/SIM_STARTUP.md` | Install + launch procedure for Ubuntu 24.04 WSL. Read THIRD (when actually setting up) |
+| `docs/SIM_STARTUP.md` | Install + launch procedure (native Linux / SSH server primary; WSL2 legacy). §0.16 = Phase 0 transect collection. Read THIRD |
 | `docs/PROJECT_TURNOVER.md` | **This file**. Status + roadmap. Read FIRST |
 
 ### Configs
@@ -203,7 +214,15 @@ A/B test for sun-azimuth convention: flipping to `az = 83.575°` produced H4b_pe
 
 **2. Pull `AStar` into the repo.** ~~Copy `AStar[T]` from `supplemental/util.py`~~ **→ DONE**. `lac/planning/astar.py` present.
 
-### IMMEDIATE (Phase 2)
+### IMMEDIATE (Phase 0.6 — server action)
+
+**Run the transect collection + re-validation.** Tooling is built and offline-validated; this is the gating re-run for the planner. **Exact steps in Section 9.A.** In brief:
+1. One-time on vader: make `LAC_SIM/RunLeaderboard.sh` env-overridable (`${VAR:-default}` for `TEAM_AGENT`/`TEAM_CONFIG`/`MISSIONS_SUBSET`).
+2. `./launch_phase0.sh` → collects to `LAC_SIM/output/Phase0CollectionAgent/<timestamp>/`.
+3. `PHASE0_DATA_DIR=<that dir> PHASE0_OUT_DIR=output/phase0_transect python scripts/phase0_validation.py`.
+4. Verdict: matched |H4b Pearson_iid| ≥ 0.2 (ideally `n_matched_temporal`) → green-light the planner; else escalate to a richer preset.
+
+### CAN RUN IN PARALLEL (Phase 2 — infrastructure, not gated)
 
 **2a. Build `lac/planning/perception_map.py`.** A class that wraps a DEM and exposes:
 - `roughness_field` (H, W) — computed at construction (5×5 cell std of z, same as phase0_validation.py)
@@ -310,6 +329,52 @@ This does NOT require Phase 0 re-run to pass — it's pure infrastructure over t
 
 ---
 
+### 9.A Run the Phase 0 transect collection — CURRENT TASK (server coding agent)
+
+Goal: drive the full-map transect on preset 2 and re-run the matched-feature validation. All code is committed; only a one-time env-passthrough edit to the (per-machine, gitignored) `RunLeaderboard.sh` is needed so `launch_phase0.sh` can swap in the collection agent.
+
+**Step 1 — one-time edit `LAC_SIM/RunLeaderboard.sh`.** Make these three lines env-overridable (the stock script hard-codes them with bare `export`, which would clobber `launch_phase0.sh`'s env):
+```bash
+export TEAM_AGENT="${TEAM_AGENT:-$TEAM_CODE_ROOT/agents/nav_agent.py}"
+export TEAM_CONFIG="${TEAM_CONFIG:-$TEAM_CODE_ROOT/configs/config.json}"
+export MISSIONS_SUBSET="${MISSIONS_SUBSET:-1}"
+```
+Leave the `PATH` prepend, `TEAM_CODE_ROOT`, and everything else unchanged.
+
+**Step 2 — pre-flight checks.**
+```bash
+cd ~/Documents/Lunar_Perception_Aware_Planning
+git pull                                  # get the new agent/generator/launch_phase0.sh
+pkill -f "LAC-Linux-Shipping" 2>/dev/null; rm -f /tmp/.X99-lock   # clear stale sim/Xvfb
+# sanity: generator imports and produces a valid raster
+PYTHONNOUSERSITE=1 python -c "import numpy as np; from lac.planning.waypoint_generation import gen_phase0_transect; p=np.eye(4); p[0,3],p[1,3]=-3.5,-6.9; w=gen_phase0_transect(p); print('waypoints', len(w))"
+```
+
+**Step 3 — collect (~20 min sim time).**
+```bash
+./launch_phase0.sh
+tail -f LAC_SIM/logs/agent.log     # watch for "Step:" / "Waypoint i/N" and a clean finalize
+```
+Watch for: steady `Waypoint i/N` progression, **no** `pynput`/display errors, **no** early `Out of power` / blocked termination, and `Phase0CollectionAgent finalize - saving log` at the end (fires when the raster's waypoints are exhausted).
+
+**Step 4 — verify the output.**
+```bash
+RUN=$(ls -dt LAC_SIM/output/Phase0CollectionAgent/*/ | head -1); echo "$RUN"
+ls "$RUN"                                  # expect data_log.json + FrontLeft/ + FrontRight/
+ls "$RUN/FrontLeft" | wc -l; ls "$RUN/FrontRight" | wc -l   # should be equal, ~5–6k each
+```
+
+**Step 5 — re-run the matched-feature validation on the transect data.**
+```bash
+PHASE0_DATA_DIR="$PWD/$RUN" PHASE0_OUT_DIR="output/phase0_transect" \
+  PYTHONNOUSERSITE=1 python scripts/phase0_validation.py
+```
+Read `output/phase0_transect/` — the stdout verdict + `response_comparison.png`. **Decision:** matched |H4b Pearson_iid| ≥ 0.2 (ideally `n_matched_temporal`) → green-light Phase 2/3/4. If still WEAK, escalate to a richer preset: change `MISSIONS_SUBSET` (e.g. 4/6/8 = presets 5/7/9), obtain that preset's ground-truth DEM from `LAC_SIM/results/`, and recompute the sun azimuth via `mission_weather` (the collection agent itself is preset-agnostic).
+
+**Notes:** the transect is collision-free by construction (sweeps clear the lander; peak probe stays north of it) and every leg is < 20 m so `WAYPOINT_TIMEOUT` (100 s) pre-empts the 300 s "blocked" termination. If a leg ever does stall, the planner force-advances — the mission won't deadlock. SIM_STARTUP §0.16 has the same procedure with more context.
+
+---
+
 ### What was installed (in order)
 
 See `docs/SIM_STARTUP.md` Section 0 for the canonical install procedure. The key steps actually executed on vader:
@@ -379,9 +444,9 @@ tail -f logs/agent.log
 
 ### Proceed with the experimental pipeline
 
-The server is fully set up. The priority-ordered plan is in **Section 5** of this document. Current next step: **Phase 2 — `lac/planning/perception_map.py`.**
+The server is fully set up. **Current next step: run the Phase 0 transect collection + re-validation — see Section 9.A above.** Phase 2 (`lac/planning/perception_map.py`) can proceed in parallel as infrastructure.
 
-Do NOT start building the core planner (Phase 4) until Phase 0 re-run confirms |r| ≥ 0.2.
+Do NOT start building the core planner (Phase 4) until the Phase 0 transect re-run confirms matched |H4b Pearson_iid| ≥ 0.2.
 
 ---
 

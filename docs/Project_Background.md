@@ -954,6 +954,9 @@ The existing `loop_closure` block is consumed unchanged by `Backend.__init__` an
 - `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json` — forces NVIDIA Vulkan ICD on the multi-GPU server.
 - DEM naming fix: `LAC_SIM/results/Moon_Map_01_1_rep0.dat` present (copy of `data/DEMs/Moon_Map_01_2_rep0.dat`; agent reads results by MISSIONS_SUBSET index, not preset number).
 
+**Phase 0 transect data-collection tooling (2026-05-27, repo code — committed, not sim-local):**
+- `agents/phase0_collection_agent.py`, `lac/planning/waypoint_generation.py:gen_phase0_transect()` (+ the `"phase0_transect"` case in `waypoint_planner.py`), and `launch_phase0.sh` at the repo root. These collect a full-map raster on preset 2 in the exact format `phase0_validation.py` reads. **Prerequisite:** the server's `LAC_SIM/RunLeaderboard.sh` must make `TEAM_AGENT`/`TEAM_CONFIG`/`MISSIONS_SUBSET` env-overridable (`${VAR:-default}`) so `launch_phase0.sh` can swap in the collection agent. See `SIM_STARTUP.md` §0.16.
+
 **Compute:** `vader.stanford.edu` — native Ubuntu 20.04, 2× NVIDIA GeForce RTX 4090 (24 GB each), 125 GB RAM. **This is the primary sim + analysis machine.** WSL2 laptop is legacy (NVIDIA RTX 4060 + Intel Iris Xe on Windows 11); UE4 4.26 cannot run on WSL2 due to a `dzn` D3D12 fence-timeout bug (see Section 13.D).
 
 **Data (current inventory):**
@@ -985,8 +988,10 @@ The existing `loop_closure` block is consumed unchanged by `Backend.__init__` an
 |---|---|---|
 | **0**   | Pre-implementation feature-density validation (does roughness predict SuperPoint feature density?) | DONE — see Section 13.C |
 | **0.5** | Same with shadow mask added (ρ_full = roughness × (1 − shadow_mask)) | DONE — see Section 13.C |
+| **0.5 v2** | Re-run with **matched features** (LightGlue temporal + stereo) as the response variable | DONE on preset 2 — WEAK (0.18); transect collection tooling built. See 13.C / 13.E |
+| **0.6** | **Collect a full-map transect on preset 2 + re-validate** (the gating re-run) | **NEXT — server action.** Tooling ready (`launch_phase0.sh`); see 13.E + SIM_STARTUP §0.16 |
 | **1**   | Pull HW3 `DEM` + `AStar` helpers into `lac/planning/` | **DONE** — `lac/planning/dem.py` + `lac/planning/astar.py`; added `DEM.from_lac_dat()` |
-| **2**   | Build `PerceptionMap` (DEM + roughness + shadow-cast) | NOT STARTED — **NEXT** |
+| **2**   | Build `PerceptionMap` (DEM + roughness + shadow-cast) | NOT STARTED — infrastructure, can proceed in parallel with 0.6 |
 | **3**   | Build `EKFCovariancePropagator` (simplified 2D state) | NOT STARTED |
 | **4**   | Build `PerceptionAwarePlanner` (A* with slope + perception terms) | NOT STARTED |
 | **5**   | Build `PerceptionAwareAgent` (drop-in fork of `agents/nav_agent.py`) | NOT STARTED |
@@ -1027,6 +1032,24 @@ Validation script: `scripts/phase0_validation.py`. Inputs: `data/DEMs/Moon_Map_0
 
 **Verdict: predictor concept is plausible; preset 2 is not a sufficient test bed. Re-validate after sim bring-up with a planned trajectory through rough/elevated regions, with matched-features as the response variable.** Do NOT pivot the predictor design based on preset 2 alone.
 
+#### Phase 0.5 v2 — matched features added (2026-05-27)
+
+`scripts/phase0_validation.py` was extended to add **matched-feature** response variables alongside raw `n_features`, addressing confound #4. It now extracts the full SuperPoint feature dict per frame and runs a LightGlue matcher (mirroring `lac/slam/feature_tracker.py`) to count:
+- `n_matched_temporal` — matches FrontLeft[i−1]↔FrontLeft[i] above `MATCH_MIN_SCORE=0.5` (trackability proxy),
+- `n_matched_stereo` — matches FrontLeft[i]↔FrontRight[i] (the SLAM frontend's triangulation filter).
+
+All three response variables get the full correlation suite (output keyed by response in `summary.json`; new `response_comparison.png`). `SUN_AZIMUTH_DEG` is now **locked at 263.575°** (the 83.575° A/B value is rejected in-code). Run output: `output/phase0_validation_matched_az263/`.
+
+**Result (preset 2, the old 7×15 m `lac_data` trajectory), H4b Pearson_iid @ best_d=3 m:**
+
+| Response | Pearson_iid | Note |
+|---|---|---|
+| n_features (auxiliary) | +0.155 | baseline |
+| **n_matched_temporal** (primary) | **+0.180** | beats raw at every distance; +0.260 at d=4 m |
+| n_matched_stereo (primary) | +0.043 | weakest (near-field depth, less tied to look-ahead) |
+
+**Verdict: WEAK** (0.18 < 0.2 green-light). Matched features *helped* — temporal matching beat the raw count and the sign stayed correct — but the dominant limiter is confirmed to be **terrain variation, not the response variable** (matching can't manufacture signal where ρ_full barely varies). This motivated building the transect collector (Section 13.E) rather than pivoting the predictor.
+
 ### 13.D Phase 8 status: sim bring-up — DEFINITIVELY BLOCKED on WSL2
 
 **Full investigation log (2026-05-26):**
@@ -1050,28 +1073,39 @@ Validation script: `scripts/phase0_validation.py`. Inputs: `data/DEMs/Moon_Map_0
 - Agent reads `results/Moon_Map_01_{MISSIONS_SUBSET}_rep0.dat` at startup — DEMs must be copied to `LAC_SIM/results/` with index-based names before first run.
 - Processes launched from Claude Code / non-interactive shells must use `nohup setsid` to survive shell resets between commands.
 
-### 13.E Updated step plan (current state 2026-05-26)
+### 13.E Updated step plan (current state 2026-05-27)
 
 ```
 DONE ✅
-├── 0. SSH server (vader.stanford.edu) fully operational — headless sim confirmed
-├── 1. lac/planning/dem.py — DEM class with from_lac_dat() added
-└── 2. lac/planning/astar.py — AStar[T] base class + path helpers
+├── 0.  SSH server (vader.stanford.edu) fully operational — headless sim confirmed
+├── 1.  lac/planning/dem.py — DEM class with from_lac_dat() added
+├── 2.  lac/planning/astar.py — AStar[T] base class + path helpers
+├── 0.5v2. Matched features added to phase0_validation.py (temporal + stereo); preset-2 re-run WEAK
+│        (0.18). Confirmed limiter = terrain variation, not the response variable.
+└── 0.6-build. Transect collection tooling built + offline-validated:
+       • lac/planning/waypoint_generation.py:gen_phase0_transect() — 8-sweep serpentine raster,
+         lander-avoiding, ≤4 m legs (beats WAYPOINT_TIMEOUT), peak probe at the (0.22,5.18) peak.
+       • waypoint_planner.py — "phase0_transect" trajectory_type.
+       • agents/phase0_collection_agent.py — headless-safe (no pynput/imshow), FrontLeft+FrontRight
+         grayscale only, image-step logging via existing DataLogger.
+       • launch_phase0.sh (repo root) — sets TEAM_AGENT + MISSIONS_SUBSET=1, execs launch_headless.sh.
+       • phase0_validation.py — PHASE0_DATA_DIR / PHASE0_OUT_DIR env overrides; frame_examples patch
+         sized from best_d so the look-ahead marker lands on the heatmap.
+       Coverage pre-check vs old box: ρ_full std 2.0×, rock std 3.5×, lit/shadow 47% vs 25%,
+       IID samples ~237 vs 39.
 
-NEXT ← YOU ARE HERE
+NEXT ← YOU ARE HERE  (server action — see SIM_STARTUP §0.16, TURNOVER §9)
+├── 0.6a. On vader: one-time RunLeaderboard.sh env-passthrough edit, then `./launch_phase0.sh`
+│         → data to LAC_SIM/output/Phase0CollectionAgent/<timestamp>/.
+└── 0.6b. PHASE0_DATA_DIR=<that dir> PHASE0_OUT_DIR=output/phase0_transect python
+          scripts/phase0_validation.py  → matched |H4b Pearson_iid| verdict.
+          ≥0.2 (ideally n_matched_temporal) green-lights the planner; else escalate to a richer
+          preset (agent is preset-agnostic: change MISSIONS_SUBSET + DEM + recompute sun azimuth).
+
+CAN RUN IN PARALLEL (infrastructure, not gated on 0.6)
 └── 2a. Build lac/planning/perception_map.py (PerceptionMap: DEM + roughness + shadow-cast)
-     Does NOT require Phase 0 re-run — pure infrastructure over the settled DEM interface.
 
-CAN RUN IN PARALLEL WITH (2a)
-├── 3. Run baseline nav_agent.py end-to-end on one rich preset (presets 5/7/9 recommended)
-├── 4. Visually verify sun azimuth convention in dem_overlays.png vs frame images
-└── 5. Plan a trajectory that crosses flat/rough/elevated terrain
-
-PHASE 0 RE-RUN (post-steps 3-5, before core planner)
-├── 6. Re-run scripts/phase0_validation.py with rich trajectory + matched-features (LightGlue)
-└── 7. Decision threshold: |H4b Pearson_iid| ≥ 0.2 before building the planner
-
-CORE PLANNER (do NOT start until step 7 clears)
+CORE PLANNER (do NOT start until 0.6b clears |r| ≥ 0.2)
 ├── 8.  Build EKFCovariancePropagator (simplified 2D state per Section 8.2)
 ├── 9.  Build PerceptionAwarePlanner (subclass AStar; edge_cost = dist*(1+α*slope_term+β*(1-ρ)))
 └── 10. Build PerceptionAwareAgent (drop-in fork of agents/nav_agent.py)

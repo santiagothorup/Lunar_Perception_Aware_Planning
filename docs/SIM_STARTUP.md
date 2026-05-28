@@ -429,6 +429,39 @@ Expected:
 
 ---
 
+### 0.16 Collect Phase 0 transect data (CURRENT TASK)
+
+Drives `agents/phase0_collection_agent.py` over the full-map `phase0_transect` raster on preset 2 and logs FrontLeft+FrontRight + ground-truth poses in the exact format `scripts/phase0_validation.py` reads. This is the gating Phase 0 re-run (the earlier preset-2 run was WEAK because the rover only covered a 7×15 m box). Decision logic and escalation are in `PROJECT_TURNOVER.md` §9.A; the mechanics:
+
+**One-time — make `RunLeaderboard.sh` env-overridable** so `launch_phase0.sh` can swap in the collection agent (the stock script hard-codes these with bare `export`):
+```bash
+export TEAM_AGENT="${TEAM_AGENT:-$TEAM_CODE_ROOT/agents/nav_agent.py}"
+export TEAM_CONFIG="${TEAM_CONFIG:-$TEAM_CODE_ROOT/configs/config.json}"
+export MISSIONS_SUBSET="${MISSIONS_SUBSET:-1}"
+```
+
+**Collect** (~20 min sim time; serpentine raster, lander-avoiding, no obstacle-avoidance needed):
+```bash
+cd ~/Documents/Lunar_Perception_Aware_Planning
+git pull
+pkill -f "LAC-Linux-Shipping" 2>/dev/null; rm -f /tmp/.X99-lock
+./launch_phase0.sh
+tail -f LAC_SIM/logs/agent.log      # watch "Step:" / "Waypoint i/N", clean finalize, no early Out-of-power
+```
+`launch_phase0.sh` sets `TEAM_AGENT=agents/phase0_collection_agent.py` + `MISSIONS_SUBSET=1` and execs `launch_headless.sh`. Output → `LAC_SIM/output/Phase0CollectionAgent/<timestamp>/` (`data_log.json` + `FrontLeft/` + `FrontRight/`; the two image folders should have equal counts).
+
+**Re-validate on the collected data:**
+```bash
+RUN=$(ls -dt LAC_SIM/output/Phase0CollectionAgent/*/ | head -1)
+PHASE0_DATA_DIR="$PWD/$RUN" PHASE0_OUT_DIR="output/phase0_transect" \
+  PYTHONNOUSERSITE=1 python scripts/phase0_validation.py
+```
+Read `output/phase0_transect/response_comparison.png` + the stdout verdict. Matched |H4b Pearson_iid| ≥ 0.2 (ideally `n_matched_temporal`) green-lights the planner build; otherwise escalate to a richer preset (the agent is preset-agnostic — change `MISSIONS_SUBSET`, obtain that preset's DEM from `results/`, recompute the sun azimuth).
+
+**Troubleshooting:** every transect leg is < 20 m, so `WAYPOINT_TIMEOUT` (2000 steps = 100 s) force-advances a stuck waypoint before the 300 s "blocked" termination — the mission won't deadlock. If the run is mistakenly in `testing` mode (30 s mission cap) the data will be near-empty; the default `RunLeaderboard.sh` (empty `--qualifier`, no `--testing`) gives the 24 h budget, so don't add those flags.
+
+---
+
 ## 1. [LEGACY — WSL2] Host setup (Ubuntu 24.04)
 
 > **⚠ WSL2 path status: BLOCKED (2026-05-26).**
@@ -769,7 +802,12 @@ When all of the following are true, you're ready for Phase 0 re-run and planner 
 - [x] `./RunLeaderboard.sh` in a second terminal prints `Step: 1, 2, 3, ...` and the rover moves ✅
 - [x] After a run, `results/Moon_Map_01_<SUBSET>_rep0.dat` appears in the sim folder ✅
 - [x] DEM naming fix applied (`results/Moon_Map_01_1_rep0.dat` present) ✅
-- [ ] `python scripts/phase0_validation.py` runs end-to-end on the preset 2 DEM (not yet re-run on server)
+- [x] `python scripts/phase0_validation.py` runs end-to-end (matched-features v2 on preset 2 — WEAK 0.18) ✅
+
+**Phase 0 transect collection (Section 0.16) — CURRENT TASK:**
+- [ ] `RunLeaderboard.sh` made env-overridable (TEAM_AGENT/TEAM_CONFIG/MISSIONS_SUBSET)
+- [ ] `./launch_phase0.sh` completes with a clean finalize; `LAC_SIM/output/Phase0CollectionAgent/<run>/` has data_log.json + FrontLeft/ + FrontRight/ (equal counts)
+- [ ] `PHASE0_DATA_DIR=<run> PHASE0_OUT_DIR=output/phase0_transect python scripts/phase0_validation.py` → verdict read; |H4b Pearson_iid| ≥ 0.2 green-lights the planner
 
 **WSL2 (legacy — do not expect the sim to run):**
 - [ ] `vkcube` opens and renders at >30 fps
