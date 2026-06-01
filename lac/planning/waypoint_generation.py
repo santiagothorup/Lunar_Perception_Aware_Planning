@@ -252,6 +252,22 @@ def gen_phase0_transect(
     return np.array(waypoints)
 
 
+def gen_phase0_probe(initial_pose: np.ndarray, drive_dist: float = 3.0):
+    """Minimal trajectory whose only purpose is to end the mission quickly so the leaderboard
+    writes the preset's ground-truth DEM (statistics_manager saves the sim terrain map at mission
+    end -> results/Moon_Map_01_<mission_id>_rep0.dat). Used to scan presets for terrain richness
+    before committing a full gen_phase0_transect run; NOT for feature data collection.
+
+    Returns a single waypoint `drive_dist` m radially OUTWARD from the start (away from the lander at
+    the origin), so the short drive can't collide with the 3x3 m lander. The rover reaches it in
+    ~15 s; WAYPOINT_TIMEOUT (100 s) is the safety net if a preset's spawn happens to be obstructed.
+    """
+    p = np.asarray(initial_pose[:2, 3], dtype=float)
+    r = float(np.linalg.norm(p))
+    direction = p / r if r > 1e-6 else np.array([1.0, 0.0])  # outward = away from lander/origin
+    return np.array([p + drive_dist * direction])
+
+
 def gen_loops_lander_lc(initial_pose):
     """
     Same as 5 loops above, but with stop and turn to loop at the lander at each corner.

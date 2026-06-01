@@ -13,6 +13,7 @@ from lac.planning.waypoint_generation import (
     gen_nine_loops,
     gen_triangle_loops,
     gen_phase0_transect,
+    gen_phase0_probe,
 )
 from lac.params import WAYPOINT_REACHED_DIST_THRESHOLD
 
@@ -35,7 +36,7 @@ class WaypointPlanner:
     ):
         """
         trajectory_type: str = "spiral", "five_loops", "nine_loops", "triangles",
-                              "phase0_transect"
+                              "phase0_transect", "phase0_probe", "perception_aware"
 
         """
         match trajectory_type:
@@ -49,6 +50,12 @@ class WaypointPlanner:
                 self.waypoints = gen_triangle_loops(initial_pose, additional_loops=False)
             case "phase0_transect":
                 self.waypoints = gen_phase0_transect(initial_pose)
+            case "phase0_probe":
+                self.waypoints = gen_phase0_probe(initial_pose)
+            case "perception_aware":
+                # Placeholder only: PerceptionAwareAgent.setup() builds a PerceptionAwarePlanner
+                # (start->goal A*) and replaces self.planner, so this WaypointPlanner never drives.
+                self.waypoints = np.asarray(initial_pose[:2, 3], dtype=float).reshape(1, 2)
             case _:
                 raise ValueError(f"Unknown trajectory type: {trajectory_type}")
 

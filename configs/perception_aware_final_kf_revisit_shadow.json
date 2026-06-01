@@ -1,0 +1,68 @@
+{
+    "planning": {
+        "trajectory": "perception_aware",
+        "waypoint_reached_threshold_m": 1.5,
+        "goal_sequence": [
+            [
+                -12.0,
+                -12.0
+            ],
+            [
+                10.0,
+                -12.0
+            ],
+            [
+                12.0,
+                12.0
+            ],
+            [
+                -7.0,
+                7.0
+            ],
+            [
+                -10.0,
+                12.0
+            ],
+            [
+                -12.0,
+                -12.0
+            ]
+        ],
+        "alpha": 2.0,
+        "beta": 0.0,
+        "perception_lookahead_m": [
+            1.5,
+            2.5,
+            3.5
+        ],
+        "traversability_weight": 0.0,
+        "shadow_weight": 2.0,
+        "anchor_weight": 0.0,
+        "waypoint_spacing_m": 2.0,
+        "detour_online_enabled": true,
+        "detour_target_mode": "keyframe",
+        "steps_since_lc_threshold": 400,
+        "max_detour_steps": 1500,
+        "max_detour_attempts_per_leg": 3,
+        "waypoint_timeout_detour_steps": 4000,
+        "detour_keyframe_min_m": 2.0,
+        "detour_keyframe_max_m": 8.0
+    },
+    "perception_map": {
+        "sun_azimuth_deg": 263.575,
+        "sun_altitude_deg": 1.488,
+        "roughness_window": 5
+    },
+    "loop_closure": {
+        "min_score": 0.5,
+        "min_matches": 100,
+        "distance_threshold_m": 1.0,
+        "angle_threshold_deg": 5.0
+    },
+    "control": {
+        "kp_linear": 1.0
+    },
+    "mapping": {
+        "rock_count_thresh": 25
+    }
+}

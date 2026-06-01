@@ -28,8 +28,12 @@ Phase 0.5 caveats (shadow-aware ρ_full extension):
   affect rank-based correlations on a single mission.
 - Rover-cast shadow on its own camera frustum is unmodeled and inflates n_features in some
   frames (a known confound on the predictor's signal).
-- Preset 2 trajectory is only ~7 m × 15 m with height range 1.86 m; a weak ρ_full correlation
-  here does NOT falsify the predictor — rerun on a more varied preset to settle the question.
+- The lander is a fixed, texture-rich object at the world origin in every preset; its keypoints
+  are uncorrelated with terrain ρ_full. They are dropped via the UNet LANDER class (MASK_LANDER,
+  on by default), and the pre-mask count is retained as n_features_raw to quantify the confound.
+- The dataset is overridable via PHASE0_DATA_DIR. The default lac_data set is a ~7 m × 15 m,
+  2000-frame preset-2 trajectory (too little terrain variation -> weak ρ_full correlation does NOT
+  falsify the predictor); the phase0_transect run covers the full ±11 m map for a stronger test.
 """
 
 from __future__ import annotations
@@ -54,13 +58,35 @@ from scipy.stats import pearsonr, spearmanr
 from tqdm import tqdm
 
 from lac.util import grayscale_to_3ch_tensor
+from lac.perception.segmentation import UnetSegmentation, SemanticClasses
+
+# The DEM field math (roughness, shadow ray-cast, rho_full, world<->grid) is shared with the
+# perception-aware planner -- lac/planning/perception_map.py is the canonical home, so this script
+# and the planner are guaranteed to use identical, validated code. load_lac_dem is the same loader
+# previously named load_dem here.
+from lac.planning.perception_map import (
+    load_lac_dem as load_dem,
+    compute_roughness_field,
+    compute_rock_density_field,
+    compute_shadow_mask,
+    compute_rho_full,
+    world_to_grid,
+    _test_shadow_pole,
+)
 
 # ============================================================================
 # CONFIG
 # ============================================================================
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEM_PATH = REPO_ROOT / "data" / "DEMs" / "Moon_Map_01_2_rep0.dat"
+# DEM is overridable so the same script validates any preset. The sun is FIXED across all presets
+# (MissionWeather hardcodes lat=-90, lon=0, date 2023-01-15 in leaderboard/missionmanager/
+# mission_weather.py), so SUN_AZIMUTH_DEG/SUN_ALTITUDE_DEG below stay valid for every preset and
+# only the DEM needs to change. A preset's ground-truth DEM is written to
+# LAC_SIM/results/Moon_Map_01_<MISSIONS_SUBSET>_rep0.dat by any completed run (statistics_manager).
+DEM_PATH = Path(
+    os.environ.get("PHASE0_DEM_PATH", REPO_ROOT / "data" / "DEMs" / "Moon_Map_01_2_rep0.dat")
+)
 
 # Input dataset. Override with PHASE0_DATA_DIR to analyze a new collection run (e.g. the
 # phase0_transect output); the directory must contain data_log.json + FrontLeft/ + FrontRight/.
@@ -107,6 +133,15 @@ SHADOW_RAY_EPS = 1e-3  # vertical lift (m) preventing self-shadow on flat terrai
 MATCH_MIN_SCORE = 0.5          # loop-closure-grade confidence (cf. configs/*.json loop_closure.min_score)
 MAX_TEMPORAL_GAP_STEPS = 2     # nominal image cadence (every other sim step); larger gap -> NaN temporal
 
+# Lander masking (preset-agnostic confound removal). The lander is a fixed, man-made, texture-rich
+# object at the world origin in EVERY preset, so SuperPoint keypoints landing on it inflate feature
+# counts in a way uncorrelated with terrain roughness/shadow (it is also not movable by preset
+# choice -- see missions_training.xml + params.LANDER_GLOBAL). We drop keypoints that fall on the
+# UNet LANDER class (lac/perception/segmentation.py:SemanticClasses.LANDER) before counting and
+# matching, so all three response variables exclude the lander. The unmasked count is retained as
+# `n_features_raw` to quantify the confound. Disable with PHASE0_MASK_LANDER=0.
+MASK_LANDER = os.environ.get("PHASE0_MASK_LANDER", "1").lower() not in ("0", "false", "no")
+
 # Statistics
 SUBSAMPLE_MIN_DIST_M = 1.0
 BOOTSTRAP_BLOCK_SIZE = 50
@@ -135,126 +170,14 @@ class DEMFields:
     rho_full: np.ndarray  # (180, 180) roughness * (1 - shadow_mask); NaN propagates from roughness
 
 
-def load_dem(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load LAC `.dat` DEM file, return (heightmap, rock_mask) as (180, 180) arrays.
-
-    The file is a `(180, 180, 4)` numpy array; channels are
-    [x_world, y_world, height_z, rock_bool] per `lac/mapping/mapper.py:process_map`.
-    """
-    arr = np.load(path, allow_pickle=True)
-    if arr.shape != (MAP_SIZE, MAP_SIZE, 4):
-        raise ValueError(f"unexpected DEM shape {arr.shape}, want ({MAP_SIZE},{MAP_SIZE},4)")
-    return arr[:, :, 2].astype(np.float64), arr[:, :, 3].astype(np.float64)
-
-
-def compute_roughness_field(z: np.ndarray, window: int) -> np.ndarray:
-    """Compute per-cell std of heights in a `window x window` neighborhood.
-
-    Uses the variance-via-uniform-filter trick (~500x faster than `generic_filter`).
-    Returns NaN at any cell whose window touches a non-finite input.
-    """
-    valid = np.isfinite(z)
-    z_clean = np.where(valid, z, 0.0)
-    mean = uniform_filter(z_clean, size=window, mode="nearest")
-    mean_sq = uniform_filter(z_clean * z_clean, size=window, mode="nearest")
-    var = np.clip(mean_sq - mean * mean, 0.0, None)  # clip away tiny negative float errors
-    rough = np.sqrt(var)
-    # Propagate NaN if any window cell was invalid.
-    valid_count = uniform_filter(valid.astype(np.float64), size=window, mode="nearest")
-    rough[valid_count < 1.0 - 1e-9] = np.nan
-    return rough
-
-
-def compute_rock_density_field(rock: np.ndarray, window: int) -> np.ndarray:
-    """Window-mean of the binary rock indicator -> continuous density in [0, 1]."""
-    return uniform_filter(rock, size=window, mode="nearest")
-
-
-def compute_shadow_mask(
-    z: np.ndarray, sun_az_deg: float, sun_alt_deg: float, cell_width: float, eps: float
-) -> np.ndarray:
-    """Cast a ray from each cell toward the sun; return True where blocked.
-
-    Convention: `sun_az_deg` is CCW from world +X in the XY plane; the DEM grid axis 0 is x,
-    axis 1 is y. The ray from a source cell rises by `cell_width * tan(alt) * hypot(di, dj)`
-    meters per DDA step (one cell along the dominant horizontal axis). A small vertical
-    offset `eps` lifts the ray off the source surface so a flat plane doesn't self-shadow.
-    """
-    az = np.radians(sun_az_deg)
-    alt = np.radians(sun_alt_deg)
-    if alt <= 0:
-        return np.ones_like(z, dtype=bool)
-    sx = float(np.cos(alt) * np.cos(az))
-    sy = float(np.cos(alt) * np.sin(az))
-    n = max(abs(sx), abs(sy))
-    if n < 1e-9:
-        return np.zeros_like(z, dtype=bool)  # sun directly overhead
-    di, dj = sx / n, sy / n
-    dh = cell_width * float(np.hypot(di, dj))
-    dz_step = dh * float(np.tan(alt))
-
-    H, W = z.shape
-    k_geom = int(np.ceil(np.sqrt(2.0) * max(H, W))) + 5
-    if dz_step > 0:
-        k_height = int(np.ceil((float(np.nanmax(z)) - float(np.nanmin(z)) + 0.5) / dz_step))
-        k_max = min(k_geom, k_height)
-    else:
-        k_max = k_geom
-
-    shadow = np.zeros_like(z, dtype=bool)
-    z_src = z + eps
-    ii, jj = np.indices(z.shape)
-
-    for k in range(1, k_max + 1):
-        oi = int(round(k * di))
-        oj = int(round(k * dj))
-        si = ii + oi
-        sj = jj + oj
-        in_bounds = (si >= 0) & (si < H) & (sj >= 0) & (sj < W)
-        if not in_bounds.any():
-            break
-        terrain = np.full_like(z, -np.inf)
-        terrain[in_bounds] = z[si[in_bounds], sj[in_bounds]]
-        shadow |= terrain > (z_src + k * dz_step)
-    return shadow
-
-
-def compute_rho_full(roughness: np.ndarray, shadow_mask: np.ndarray) -> np.ndarray:
-    """ρ_full = roughness * (1 - shadow_mask). NaN propagates from `roughness`."""
-    return roughness * (1.0 - shadow_mask.astype(np.float64))
-
-
-def _test_shadow_pole() -> None:
-    """Self-test: a 1 m pole on a flat plane should cast a long shadow in the anti-sun direction.
-
-    At sun_az=180°, sun_alt=1° the sun is in -x with a near-horizontal ray, so cells with i > pole_i
-    look toward the pole (in -x) and ARE shadowed; cells with i < pole_i look away and ARE NOT.
-    Shadow length ~ 1/tan(1°) ≈ 57 m ≈ 381 cells at CELL_WIDTH=0.15.
-    """
-    z = np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.float64)
-    pi, pj = 90, 90
-    z[pi, pj] = 1.0
-    mask = compute_shadow_mask(z, sun_az_deg=180.0, sun_alt_deg=1.0, cell_width=0.15, eps=1e-3)
-    assert mask[pi + 1, pj], "cell directly +x of pole should be shadowed"
-    assert mask[pi + 80, pj], "cell +80 in shadow column should be shadowed (within 381-cell shadow)"
-    assert not mask[pi - 1, pj], "sun-facing side cell must not be shadowed"
-    assert not mask[pi, pj], "pole's own cell must not be shadowed (eps lifts ray)"
-    assert not mask[pi + 1, pj + 5], "off-axis cell must not be shadowed for purely-x sun"
-    print("[ok] shadow self-test passed")
+# DEM field functions (load_dem, compute_roughness_field, compute_rock_density_field,
+# compute_shadow_mask, compute_rho_full, _test_shadow_pole) now live in
+# lac/planning/perception_map.py and are imported at the top of this file.
 
 
 # ============================================================================
 # Frame / pose handling
 # ============================================================================
-
-
-def world_to_grid(x: float, y: float) -> tuple[int, int] | None:
-    """Convert world (x, y) in meters to DEM (i, j) cell indices, or None if OOB."""
-    if abs(x) > MAP_EXTENT or abs(y) > MAP_EXTENT:
-        return None
-    i = min(MAP_SIZE - 1, max(0, int((x + MAP_EXTENT) / CELL_WIDTH)))
-    j = min(MAP_SIZE - 1, max(0, int((y + MAP_EXTENT) / CELL_WIDTH)))
-    return i, j
 
 
 def load_frames(json_path: Path) -> list[dict]:
@@ -332,8 +255,80 @@ def extract_features(
 
 def count_matches(matcher: LightGlue, feats_a: dict, feats_b: dict, min_score: float) -> int:
     """Count LightGlue matches between two raw SuperPoint feature dicts that exceed `min_score`."""
+    # Lander masking can prune a frame down to 0 keypoints; LightGlue errors on an empty set.
+    if feats_a["keypoints"].shape[1] == 0 or feats_b["keypoints"].shape[1] == 0:
+        return 0
     m = rbd(matcher({"image0": feats_a, "image1": feats_b}))
     return int((m["scores"] > min_score).sum())
+
+
+# ============================================================================
+# Lander masking (preset-agnostic confound removal)
+# ============================================================================
+
+
+def init_segmentation() -> UnetSegmentation | None:
+    """UNet++ segmentation model used for lander masking, or None when masking is disabled.
+
+    Loads models/unet_v2.pth onto the GPU (the same model + grayscale camera feed the SLAM frontend
+    uses in lac/slam/frontend.py). Returns None if PHASE0_MASK_LANDER is off.
+    """
+    if not MASK_LANDER:
+        return None
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA not available; UNet segmentation needs GPU for lander masking")
+    return UnetSegmentation()
+
+
+def lander_mask_for_image(seg: UnetSegmentation, img: np.ndarray) -> np.ndarray:
+    """(H, W) bool mask, True where the UNet predicts LANDER. `img` is (H, W) uint8 grayscale.
+
+    UnetSegmentation.predict expects a 3-channel image (it runs cvtColor BGR2RGB internally), so we
+    replicate the grayscale frame to 3 channels first. The returned class map is in original-image
+    pixel coords (predict resizes its output back), aligning with extract_features' rescaled kpts.
+    """
+    img3 = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    pred = seg.predict(img3)
+    return pred == SemanticClasses.LANDER.value
+
+
+def _prune_feats(feats: dict, keep_idx: np.ndarray) -> dict:
+    """Filter a SuperPoint feats dict to `keep_idx` keypoints along the keypoint axis.
+
+    Mirrors lac/slam/feature_tracker.py:prune_features; `image_size` is left untouched so LightGlue's
+    positional encoding stays correct. Keeps the batch dim.
+    """
+    idx = torch.as_tensor(keep_idx, dtype=torch.long, device=feats["keypoints"].device)
+    return {k: (v if k == "image_size" else v[:, idx]) for k, v in feats.items()}
+
+
+def extract_features_masked(
+    extractor: SuperPoint, img: np.ndarray, seg: UnetSegmentation | None
+) -> tuple[int, float, np.ndarray, np.ndarray, dict, int, float]:
+    """extract_features, then drop keypoints on LANDER-class pixels.
+
+    Returns (n, mean_score, kpts, scores, feats, n_raw, lander_frac). `feats` is pruned to the kept
+    keypoints so downstream LightGlue matching also excludes the lander. With seg=None this reduces
+    to extract_features with n_raw=n and lander_frac=0.0. `kpts`/`feats` keypoints share an index
+    order (extract_features only rescales a CPU copy), so the keep-set computed from `kpts` prunes
+    `feats` correctly.
+    """
+    n, mean_score, kpts, scores, feats = extract_features(extractor, img)
+    n_raw = n
+    lander_frac = 0.0
+    if seg is not None and n > 0:
+        lander = lander_mask_for_image(seg, img)
+        h, w = lander.shape
+        xi = np.clip(np.rint(kpts[:, 0]).astype(int), 0, w - 1)
+        yi = np.clip(np.rint(kpts[:, 1]).astype(int), 0, h - 1)
+        on_lander = lander[yi, xi]
+        lander_frac = float(on_lander.mean())
+        keep = np.flatnonzero(~on_lander)
+        kpts, scores = kpts[keep], scores[keep]
+        feats = _prune_feats(feats, keep)
+        n = int(keep.size)
+        mean_score = float(scores.mean()) if n > 0 else float("nan")
+    return n, mean_score, kpts, scores, feats, n_raw, lander_frac
 
 
 # ============================================================================
@@ -347,14 +342,16 @@ def process_all_frames(
     matcher: LightGlue,
     fields: DEMFields,
     distances: tuple[float, ...],
+    seg: UnetSegmentation | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """Iterate frames, extract features + matched-feature counts, sample DEM fields.
 
-    Three response variables per frame:
-      - n_features          : raw SuperPoint keypoint count on FrontLeft (auxiliary baseline).
+    Response variables per frame (all lander-masked when `seg` is provided):
+      - n_features          : SuperPoint keypoint count on FrontLeft (auxiliary baseline).
       - n_matched_temporal  : LightGlue matches FrontLeft[i-1]<->FrontLeft[i] above MATCH_MIN_SCORE.
                               NaN on the first frame and across any image-cadence gap.
       - n_matched_stereo    : LightGlue matches FrontLeft[i]<->FrontRight[i]. NaN if right is missing.
+    Plus diagnostics: n_features_raw (pre-mask count) and lander_kp_frac (fraction dropped).
     """
     rows: list[dict] = []
     skipped_no_image = 0
@@ -384,7 +381,9 @@ def process_all_frames(
             warnings.warn(f"image not loadable: {img_path}")
             continue  # prev_feats/prev_step intentionally NOT updated -> next frame's temporal = NaN
 
-        n_feats, mean_score, _, _, feats_l = extract_features(extractor, img)
+        n_feats, mean_score, _, _, feats_l, n_feats_raw, lander_frac = extract_features_masked(
+            extractor, img, seg
+        )
 
         # Temporal match: FrontLeft[i-1] <-> FrontLeft[i], only if frames are cadence-adjacent.
         if prev_feats is not None and (step - prev_step) <= MAX_TEMPORAL_GAP_STEPS:
@@ -398,7 +397,7 @@ def process_all_frames(
             skipped_no_image_right += 1
             n_matched_stereo = float("nan")
         else:
-            _, _, _, _, feats_r = extract_features(extractor, img_r)
+            _, _, _, _, feats_r, _, _ = extract_features_masked(extractor, img_r, seg)
             n_matched_stereo = count_matches(matcher, feats_l, feats_r, MATCH_MIN_SCORE)
 
         prev_feats, prev_step = feats_l, step
@@ -411,6 +410,8 @@ def process_all_frames(
             "y": y,
             "heading_deg": heading_deg,
             "n_features": n_feats,
+            "n_features_raw": n_feats_raw,
+            "lander_kp_frac": lander_frac,
             "n_matched_temporal": n_matched_temporal,
             "n_matched_stereo": n_matched_stereo,
             "mean_score": mean_score,
@@ -440,6 +441,10 @@ def process_all_frames(
         "n_skipped_no_image": skipped_no_image,
         "n_skipped_no_image_right": skipped_no_image_right,
         "n_skipped_oob_pose": skipped_oob_pose,
+        "mask_lander": bool(seg is not None),
+        "mean_lander_kp_frac": float(df["lander_kp_frac"].mean()) if len(df) else 0.0,
+        "mean_n_features_raw": float(df["n_features_raw"].mean()) if len(df) else 0.0,
+        "mean_n_features_masked": float(df["n_features"].mean()) if len(df) else 0.0,
     }
     return df, counters
 
@@ -661,7 +666,7 @@ def plot_dem_overlays(fields: DEMFields, traj_xy: np.ndarray, out_path: Path) ->
     )
     ax.text(0.5, 1.0, "→ sun", color="orange", fontsize=9, fontweight="bold")
 
-    fig.suptitle("Preset 2 DEM with rover trajectory (Phase 0.5: shadow-aware)")
+    fig.suptitle(f"{DEM_PATH.name} with rover trajectory (Phase 0.5: shadow-aware)")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -674,8 +679,14 @@ def plot_frame_examples(
     fields: DEMFields,
     best_d: float,
     out_path: Path,
+    seg: UnetSegmentation | None = None,
 ) -> None:
-    """For each example frame: image + keypoints, roughness/shadow overlay patch, rho_full patch."""
+    """For each example frame: image + keypoints, roughness/shadow overlay patch, rho_full patch.
+
+    When `seg` is provided, the lander mask is overlaid (translucent red) and only the KEPT
+    (non-lander) keypoints are scattered, so this doubles as the visual confirmation that masking
+    matches the per-frame counts.
+    """
     n = len(example_idxs)
     fig, axes = plt.subplots(n, 3, figsize=(15, 5 * n))
     if n == 1:
@@ -686,15 +697,18 @@ def plot_frame_examples(
     for row_i, frame_idx in enumerate(example_idxs):
         row = df.iloc[frame_idx]
         img = cv2.imread(str(IMG_DIR / row["image_filename"]), cv2.IMREAD_GRAYSCALE)
-        n_kp, _, kpts, scores, _ = extract_features(extractor, img)
+        n_kp, _, kpts, scores, _, n_raw, lander_frac = extract_features_masked(extractor, img, seg)
 
         ax_img = axes[row_i, 0]
         ax_img.imshow(img, cmap="gray")
+        if seg is not None:
+            lander = lander_mask_for_image(seg, img)
+            ax_img.imshow(np.ma.masked_where(~lander, lander), cmap="autumn", alpha=0.35)
         if n_kp > 0:
             sizes = 4 + 30 * (scores / (scores.max() + 1e-9))
             ax_img.scatter(kpts[:, 0], kpts[:, 1], s=sizes, c="red", alpha=0.6, edgecolors="none")
         ax_img.set_title(
-            f"step={row['step']}, n_feats={n_kp}, "
+            f"step={row['step']}, n_feats={n_kp} (raw {n_raw}, lander {lander_frac * 100:.0f}%), "
             f"match_t={row['n_matched_temporal']:.0f}, match_s={row['n_matched_stereo']:.0f}\n"
             f"rho_full@LA={row[f'rho_full_la_{best_d}']:.4f}, "
             f"shadow@LA={row[f'shadow_la_{best_d}']:.0f}"
@@ -912,7 +926,8 @@ def plot_response_comparison(corr_by_resp: dict[str, dict], out_path: Path) -> N
     (the verdict statistic), dashed = Pearson_raw, X at x=0 = H4a (rho_full @ pose).
     """
     fig, ax = plt.subplots(figsize=(11, 6.5))
-    colors = {"n_features": "C7", "n_matched_temporal": "C0", "n_matched_stereo": "C3"}
+    colors = {"n_features": "C7", "n_matched_temporal": "C0", "n_matched_stereo": "C3",
+              "n_features_raw": "C1"}  # raw (unmasked) shown vs masked n_features to expose the lander confound
 
     for resp, corr in corr_by_resp.items():
         ds = sorted(corr["per_d"].keys())
@@ -969,10 +984,12 @@ def write_summary(
         "BOOTSTRAP_BLOCK_SIZE": BOOTSTRAP_BLOCK_SIZE,
         "BOOTSTRAP_N": BOOTSTRAP_N,
         "BOOTSTRAP_CI_PCT": BOOTSTRAP_CI_PCT,
+        "MASK_LANDER": bool(counters.get("mask_lander", False)),
         "response_variables": {
-            "n_features": "raw SuperPoint keypoint count on FrontLeft (auxiliary baseline)",
-            "n_matched_temporal": "LightGlue matches FrontLeft[i-1]<->FrontLeft[i] above MATCH_MIN_SCORE",
-            "n_matched_stereo": "LightGlue matches FrontLeft[i]<->FrontRight[i] above MATCH_MIN_SCORE",
+            "n_features": "SuperPoint keypoint count on FrontLeft, lander-masked when MASK_LANDER (auxiliary baseline)",
+            "n_matched_temporal": "LightGlue matches FrontLeft[i-1]<->FrontLeft[i] above MATCH_MIN_SCORE (lander-masked)",
+            "n_matched_stereo": "LightGlue matches FrontLeft[i]<->FrontRight[i] above MATCH_MIN_SCORE (lander-masked)",
+            "n_features_raw": "SuperPoint keypoint count on FrontLeft BEFORE lander masking (confound baseline)",
         },
     }
 
@@ -1029,6 +1046,13 @@ def print_stdout_summary(
     print(f"KP saturation @{SUPERPOINT_MAX_KP:<4d}   : {saturation_pct:.2f}%")
     if saturation_pct > SATURATION_PCT_WARN:
         print(f"  WARNING: rerun with higher SUPERPOINT_MAX_KP and rename output dir for parity.")
+    if counters.get("mask_lander"):
+        print(f"Lander masking          : ON  (mean {counters['mean_lander_kp_frac'] * 100:.1f}% of "
+              f"keypoints/frame dropped)")
+        print(f"  mean n_features raw->masked: {counters['mean_n_features_raw']:.0f} -> "
+              f"{counters['mean_n_features_masked']:.0f}")
+    else:
+        print(f"Lander masking          : OFF (PHASE0_MASK_LANDER=0)")
     print(f"Sun azimuth             : {SUN_AZIMUTH_DEG:.3f}° (CCW from +X), alt {SUN_ALTITUDE_DEG:.3f}°")
     print()
 
@@ -1070,10 +1094,11 @@ def print_stdout_summary(
         print(f"  driven by {best_resp} (|Pearson_iid|={best_iid:.3f} at best_d="
               f"{matched[best_resp]['best_d']:.1f}m)")
     print()
-    print("NOTE: preset 2 trajectory occupies a 7m x 15m sub-region with height range 1.86 m.")
-    print("A weak r on preset 2 alone does NOT falsify the predictor. Visually verify the shadow")
-    print("direction in dem_overlays.png (bottom-left panel) and frame_examples.png before pivoting.")
-    print("Cross-check the response-variable comparison in response_comparison.png.")
+    print(f"NOTE: dataset = {DATA_DIR.name}. Before trusting/pivoting on these numbers, visually verify:")
+    print("  (1) shadow direction in dem_overlays.png (bottom-left) matches frame_examples.png;")
+    print("  (2) the lander overlay in frame_examples.png covers the lander and only the lander")
+    print("      (over-masking would suppress real terrain features, under-masking leaves the confound);")
+    print("  (3) the raw-vs-masked gap in response_comparison.png isolates the lander's effect.")
     print()
     print(f"Total runtime: {runtime_s:.1f} s")
     print(f"Outputs: {OUT_DIR}")
@@ -1115,12 +1140,19 @@ def main() -> None:
     extractor = init_superpoint(SUPERPOINT_MAX_KP)
     matcher = init_matcher()
 
+    seg = init_segmentation()
+    print(f"Lander masking: {'ON (UNet LANDER class)' if seg is not None else 'OFF'}")
+
     print("Processing frames (SuperPoint + LightGlue temporal/stereo matches + DEM lookups)")
-    df, counters = process_all_frames(frames, extractor, matcher, fields, LOOKAHEAD_DISTANCES_M)
+    df, counters = process_all_frames(frames, extractor, matcher, fields, LOOKAHEAD_DISTANCES_M, seg)
 
-    saturation_pct = 100.0 * (df["n_features"] == SUPERPOINT_MAX_KP).sum() / max(len(df), 1)
+    # Saturation is a property of the raw SuperPoint extraction (before masking drops keypoints),
+    # so it must be measured on n_features_raw, not the masked n_features.
+    saturation_pct = 100.0 * (df["n_features_raw"] == SUPERPOINT_MAX_KP).sum() / max(len(df), 1)
 
-    # Response variables: matched features are PRIMARY; raw n_features is the auxiliary baseline.
+    # Response variables: matched features are PRIMARY; masked n_features is the auxiliary baseline.
+    # n_features_raw (pre-mask) is added afterwards so the comparison plot/summary quantify how much
+    # the lander confound moved the correlation. It gets correlations but not its own plot set.
     response_vars = ("n_features", "n_matched_temporal", "n_matched_stereo")
     suffix = {"n_features": "nfeat", "n_matched_temporal": "matched_temporal", "n_matched_stereo": "matched_stereo"}
 
@@ -1129,6 +1161,10 @@ def main() -> None:
         resp: compute_all_correlations(df, LOOKAHEAD_DISTANCES_M, rng, response_col=resp)
         for resp in response_vars
     }
+    if seg is not None:
+        corr_by_resp["n_features_raw"] = compute_all_correlations(
+            df, LOOKAHEAD_DISTANCES_M, rng, response_col="n_features_raw"
+        )
 
     print("Generating plots")
     traj_xy = df[["x", "y"]].to_numpy()
@@ -1147,7 +1183,7 @@ def main() -> None:
     primary = corr_by_resp.get("n_matched_temporal", corr_by_resp["n_features"])
     best_d = primary["best_d"]
     example_idxs = select_example_frames(df, best_d, EXAMPLE_FRAME_COUNT, EXAMPLE_MIN_STEP_GAP)
-    plot_frame_examples(df, example_idxs, extractor, fields, best_d, OUT_DIR / "frame_examples.png")
+    plot_frame_examples(df, example_idxs, extractor, fields, best_d, OUT_DIR / "frame_examples.png", seg)
 
     runtime = time.time() - t0
     write_summary(df, corr_by_resp, counters, saturation_pct, runtime, OUT_DIR)

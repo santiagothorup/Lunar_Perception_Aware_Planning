@@ -30,6 +30,13 @@ export DISPLAY=:$DISPLAY_NUM
 # Pin UE4 to the NVIDIA GPU (prevents it picking Intel iGPU if both ICDs present)
 export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
 
+# Reduce CUDA OOM from fragmentation: the UE4 sim holds ~21 GB of the 24 GB GPU; the agent's
+# LightGlue feature matching needs to allocate small buffers as the keyframe DB grows.
+# expandable_segments lets PyTorch grow its cache without contiguous-block requirements, avoiding
+# the OOM observed at ~step 3000 on the tour reruns. See
+# https://pytorch.org/docs/stable/notes/cuda.html#environment-variables
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # ── 2. Start simulator ───────────────────────────────────────────────────────
 echo "[launch] Starting LunarSimulator (logs → $LOGS/sim.log)"
 cd "$SIM"
